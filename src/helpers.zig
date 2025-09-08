@@ -544,24 +544,24 @@ pub fn getAddressList(incoming_name: []const u8, port: u16, allocator: std.mem.A
     var name_buffer: [128][]const u8 = undefined;
     const name = try dns.Name.fromString(incoming_name, &name_buffer);
 
-    var final_list = std.ArrayList(std.net.Address).init(allocator);
-    defer final_list.deinit();
+    var final_list: std.ArrayList(std.net.Address) = .empty;
+    defer final_list.deinit(allocator);
 
     const last_label = name.full.labels[name.full.labels.len - 1];
 
     // see if we can short-circuit on parsing the name as addr
     if (std.net.Address.parseExpectingFamily(incoming_name, std.posix.AF.INET, port) catch null) |addr| {
-        try final_list.append(addr);
+        try final_list.append(allocator, addr);
     } else if (std.net.Address.parseExpectingFamily(incoming_name, std.posix.AF.INET6, port) catch null) |addr| {
-        try final_list.append(addr);
+        try final_list.append(allocator, addr);
     } else if (std.mem.eql(u8, last_label, "localhost")) {
         // RFC 6761 Section 6.3.3
         // Name resolution APIs and libraries SHOULD recognize localhost
         // names as special and SHOULD always return the IP loopback address
         // for address queries and negative responses for all other query
         // types.
-        try final_list.append(std.net.Address.parseIp4("127.0.0.1", port) catch unreachable);
-        try final_list.append(std.net.Address.parseIp6("::1", port) catch unreachable);
+        try final_list.append(allocator, std.net.Address.parseIp4("127.0.0.1", port) catch unreachable);
+        try final_list.append(allocator, std.net.Address.parseIp6("::1", port) catch unreachable);
     } else {
         if (builtin.os.tag == .windows) {
             const name_c = try allocator.dupeZ(u8, incoming_name);
@@ -616,7 +616,7 @@ pub fn getAddressList(incoming_name: []const u8, port: u16, allocator: std.mem.A
                         );
                         const addr = std.net.Address.initIp4(@as([4]u8, @bitCast(sa.addr)), sa.port);
 
-                        try final_list.append(addr);
+                        try final_list.append(allocator, addr);
                     },
                     ws2_32.AF.INET6 => {
                         const sa: *ws2_32.sockaddr.in6 = @as(
@@ -625,7 +625,7 @@ pub fn getAddressList(incoming_name: []const u8, port: u16, allocator: std.mem.A
                         );
                         const addr = std.net.Address.initIp6(sa.addr, sa.port, 0, 0);
 
-                        try final_list.append(addr);
+                        try final_list.append(allocator, addr);
                     },
                     else => continue,
                 }
@@ -638,11 +638,11 @@ pub fn getAddressList(incoming_name: []const u8, port: u16, allocator: std.mem.A
                 // if that didn't work, go to dns server
                 const addrs_v4 = try fetchTrustedAddresses(allocator, name, .A);
                 defer allocator.free(addrs_v4);
-                for (addrs_v4) |addr| try final_list.append(addr);
+                for (addrs_v4) |addr| try final_list.append(allocator, addr);
 
                 const addrs_v6 = try fetchTrustedAddresses(allocator, name, .AAAA);
                 defer allocator.free(addrs_v6);
-                for (addrs_v6) |addr| try final_list.append(addr);
+                for (addrs_v6) |addr| try final_list.append(allocator, addr);
             }
         } else @compileError("getAddressList not supported on this target");
     }
