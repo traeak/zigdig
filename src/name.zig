@@ -52,13 +52,13 @@ pub const Name = union(enum) {
 
     /// Caller owns returned memory.
     pub fn readFrom(
-        reader: anytype,
+        reader: *std.Io.Reader,
         options: dns.ParserOptions,
     ) !?Self {
-        const current_byte_index = reader.context.ctx.current_byte_count;
+        const current_byte_index = reader.seek;
 
         if (options.allocator) |allocator| {
-            var components = std.ArrayList(LabelComponent).init(allocator);
+            var components = std.array_list.Managed(LabelComponent).init(allocator);
             defer components.deinit();
 
             var has_pointer: bool = false;
@@ -114,7 +114,7 @@ pub const Name = union(enum) {
     ///  - a full label ([]const u8)
     ///  - a null octet
     fn readLabelComponent(
-        reader: anytype,
+        reader: *std.Io.Reader,
         maybe_allocator: ?std.mem.Allocator,
     ) !?LabelComponent {
         // pointers, in the binary representation of a byte, are as follows
@@ -135,9 +135,9 @@ pub const Name = union(enum) {
         // if the length is 0, its a null octet
         logger.debug(
             "reading label component at {d} bytes",
-            .{reader.context.ctx.current_byte_count},
+            .{reader.seek},
         );
-        const possible_length = try reader.readInt(u8, .big);
+        const possible_length = try reader.takeInt(u8, .big);
         if (possible_length == 0) return LabelComponent{ .Null = {} };
 
         // RFC1035:
@@ -148,7 +148,7 @@ pub const Name = union(enum) {
         const bit2 = (possible_length & (1 << 6)) != 0;
 
         if (bit1 and bit2) {
-            const second_offset_component = try reader.readInt(u8, .big);
+            const second_offset_component = try reader.takeInt(u8, .big);
 
             // merge them together
             var offset: u16 = (possible_length << 7) | second_offset_component;
@@ -166,23 +166,27 @@ pub const Name = union(enum) {
             // the next <possible_length> bytes contain a full label.
             if (maybe_allocator) |allocator| {
                 const label = try allocator.alloc(u8, possible_length);
-                const read_bytes = try reader.read(label);
-                if (read_bytes != label.len) logger.err(
-                    "possible_length = {d} read_bytes = {d} label.len = {d}",
-                    .{ possible_length, read_bytes, label.len },
-                );
-                std.debug.assert(read_bytes == label.len);
+                reader.readSliceAll(label) catch |e| switch (e) {
+                    error.EndOfStream => {
+                        logger.err(
+                            "possible_length = {d}, label.len = {d}. failed to fill",
+                            .{ possible_length, label.len },
+                        );
+                        return error.EndOfStream;
+                    },
+                    else => return e,
+                };
                 return LabelComponent{ .Full = label };
             } else {
                 logger.debug("read_name: skip {d} bytes as no alloc", .{possible_length});
-                try reader.skipBytes(possible_length, .{});
+                reader.toss(possible_length);
                 return null;
             }
         }
     }
 
     /// Write the network representation of a name onto a stream.
-    pub fn writeTo(self: Self, writer: anytype) !usize {
+    pub fn writeTo(self: Self, writer: *std.Io.Writer) !void {
         return switch (self) {
             // NOTE we don't serialize to pointers.
             .raw => unreachable, // must convert to full name to be able to write
@@ -203,17 +207,12 @@ pub const Name = union(enum) {
         return .{ .full = try FullName.fromString(domain, buffer) };
     }
 
-    pub fn format(
-        self: Self,
-        comptime f: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
+    pub fn format(self: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         return switch (self) {
-            .full => |full| full.format(f, options, writer),
+            .full => |full| full.format(writer),
             .raw => |raw| for (raw.components) |component| switch (component) {
-                .Pointer => |ptr| try std.fmt.format(writer, "(pointer={d}).", .{ptr}),
-                .Full => |label| try std.fmt.format(writer, "{s}.", .{label}),
+                .Pointer => |ptr| try writer.print("(pointer={d}).", .{ptr}),
+                .Full => |label| try writer.print("{s}.", .{label}),
                 .Null => break,
             },
         };
@@ -251,7 +250,7 @@ pub const FullName = struct {
         components: []LabelComponent,
         packet_index: ?usize,
     ) !Self {
-        var labels = std.ArrayList([]const u8).init(allocator);
+        var labels = std.array_list.Managed([]const u8).init(allocator);
         defer labels.deinit();
 
         for (components) |component| switch (component) {
@@ -325,42 +324,30 @@ pub const FullName = struct {
         return Self{ .labels = buffer[0..idx] };
     }
 
-    pub fn writeTo(self: Self, writer: anytype) !usize {
-        var size: usize = 0;
+    pub fn writeTo(self: Self, writer: *std.Io.Writer) !void {
         for (self.labels) |label| {
             std.debug.assert(label.len < 255);
 
             try writer.writeInt(u8, @as(u8, @intCast(label.len)), .big);
-            size += 1;
 
             for (label) |byte| {
                 try writer.writeByte(byte);
-                size += 1;
             }
         }
 
         // null-octet for the end of labels for this name
         try writer.writeByte(@as(u8, 0));
-        return size + 1;
     }
 
     /// Format the given DNS name.
-    pub fn format(
-        self: Self,
-        comptime f: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = f;
-        _ = options;
-
+    pub fn format(self: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         for (self.labels) |label| {
-            try std.fmt.format(writer, "{s}.", .{label});
+            try writer.print("{s}.", .{label});
         }
     }
 };
 
-const NameList = std.ArrayList(dns.Name);
+const NameList = std.array_list.Managed(dns.Name);
 
 /// Implements RFC1035, section 4.1.4 Message Compression.
 ///
@@ -402,7 +389,7 @@ pub const NamePool = struct {
             .raw => |raw| blk: {
                 defer name.deinit(self.allocator);
                 // this ends in a Pointer, create a new FullName
-                var resolved_labels = std.ArrayList([]const u8).init(self.allocator);
+                var resolved_labels = std.array_list.Managed([]const u8).init(self.allocator);
                 defer resolved_labels.deinit();
 
                 for (raw.components) |raw_component| switch (raw_component) {
@@ -462,7 +449,7 @@ pub const NamePool = struct {
 
                             for (self.held_names.items) |held_name| {
                                 logger.warn(
-                                    "known name: {} at offset {?d}",
+                                    "known name: {f} at offset {?d}",
                                     .{ held_name, held_name.full.packet_index },
                                 );
                             }

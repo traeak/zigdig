@@ -69,7 +69,7 @@ pub fn printAsZoneFile(
         try writer.print(";;name\ttype\tclass\n", .{});
 
         for (packet.questions) |question| {
-            try writer.print(";{?}\t{s}\t{s}\n", .{
+            try writer.print(";{?f}\t{s}\t{s}\n", .{
                 question.name,
                 @tagName(question.typ),
                 @tagName(question.class),
@@ -125,12 +125,10 @@ pub const DNSConnection = struct {
         // a buffer, and then send that
         var buffer: [1024]u8 = undefined;
 
-        const typ = std.io.FixedBufferStream([]u8);
-        var stream = typ{ .buffer = &buffer, .pos = 0 };
+        var writer = std.io.Writer.fixed(&buffer);
+        try packet.writeTo(&writer);
 
-        const written_bytes = try packet.writeTo(stream.writer());
-
-        const result = buffer[0..written_bytes];
+        const result = buffer[0..writer.end];
         const dest_len: u32 = switch (self.address.any.family) {
             std.posix.AF.INET => @sizeOf(std.posix.sockaddr.in),
             std.posix.AF.INET6 => @sizeOf(std.posix.sockaddr.in6),
@@ -164,11 +162,8 @@ pub const DNSConnection = struct {
         const packet_bytes = packet_buffer[0..read_bytes];
         logger.debug("read {d} bytes", .{read_bytes});
 
-        var stream = std.io.FixedBufferStream([]const u8){
-            .buffer = packet_bytes,
-            .pos = 0,
-        };
-        return parseFullPacket(stream.reader(), packet_allocator, options);
+        var stream = std.io.Reader.fixed(packet_bytes);
+        return parseFullPacket(&stream, packet_allocator, options);
     }
 };
 
@@ -181,7 +176,7 @@ pub const ParseFullPacketOptions = struct {
 };
 
 pub fn parseFullPacket(
-    reader: anytype,
+    reader: *std.Io.Reader,
     allocator: std.mem.Allocator,
     parse_full_packet_options: ParseFullPacketOptions,
 ) !dns.IncomingPacket {
@@ -205,16 +200,16 @@ pub fn parseFullPacket(
     else
         &builtin_name_pool;
 
-    var questions = std.ArrayList(dns.Question).init(allocator);
+    var questions = std.array_list.Managed(dns.Question).init(allocator);
     defer questions.deinit();
 
-    var answers = std.ArrayList(dns.Resource).init(allocator);
+    var answers = std.array_list.Managed(dns.Resource).init(allocator);
     defer answers.deinit();
 
-    var nameservers = std.ArrayList(dns.Resource).init(allocator);
+    var nameservers = std.array_list.Managed(dns.Resource).init(allocator);
     defer nameservers.deinit();
 
-    var additionals = std.ArrayList(dns.Resource).init(allocator);
+    var additionals = std.array_list.Managed(dns.Resource).init(allocator);
     defer additionals.deinit();
 
     while (try parser.next()) |part| {
@@ -300,10 +295,12 @@ pub fn randomNameserver(output_buffer: []u8) !?[]const u8 {
     // this doesn't need any allocator or lists or whatever. just the
     // output buffer
 
-    try file.seekTo(0);
     var line_buffer: [1024]u8 = undefined;
+    var reader = file.reader(&line_buffer);
+    try reader.seekTo(0);
+
     var nameserver_amount: usize = 0;
-    while (try file.reader().readUntilDelimiterOrEof(&line_buffer, '\n')) |line| {
+    while (try reader.interface.takeDelimiter('\n')) |line| {
         if (std.mem.startsWith(u8, line, "#")) continue;
 
         var ns_it = std.mem.splitSequence(u8, line, " ");
@@ -319,10 +316,11 @@ pub fn randomNameserver(output_buffer: []u8) !?[]const u8 {
     var r = std.Random.DefaultPrng.init(seed);
     const selected = r.random().uintLessThan(usize, nameserver_amount);
 
-    try file.seekTo(0);
+    try reader.seekTo(0);
 
     var current_nameserver: usize = 0;
-    while (try file.reader().readUntilDelimiterOrEof(&line_buffer, '\n')) |line| {
+
+    while (try reader.interface.takeDelimiter('\n')) |line| {
         if (std.mem.startsWith(u8, line, "#")) continue;
 
         var ns_it = std.mem.splitSequence(u8, line, " ");
@@ -351,7 +349,7 @@ const AddressList = struct {
         self.allocator.free(self.addrs);
     }
 
-    fn fromList(allocator: std.mem.Allocator, addrs: *std.ArrayList(std.net.Address)) !AddressList {
+    fn fromList(allocator: std.mem.Allocator, addrs: *std.array_list.Managed(std.net.Address)) !AddressList {
         return AddressList{ .allocator = allocator, .addrs = try addrs.toOwnedSlice() };
     }
 };
@@ -380,16 +378,13 @@ pub fn receiveTrustedAddresses(
     const packet_bytes = packet_buffer[0..read_bytes];
     logger.debug("read {d} bytes", .{read_bytes});
 
-    var stream = std.io.FixedBufferStream([]const u8){
-        .buffer = packet_bytes,
-        .pos = 0,
-    };
+    var reader = std.Io.Reader.fixed(packet_bytes);
 
     var ctx = dns.ParserContext{};
 
-    var parser = dns.parser(stream.reader(), &ctx, .{});
+    var parser = dns.parser(&reader, &ctx, .{});
 
-    var addrs = std.ArrayList(std.net.Address).init(allocator);
+    var addrs = std.array_list.Managed(std.net.Address).init(allocator);
     errdefer addrs.deinit();
 
     var current_resource: ?dns.Resource = null;
@@ -419,21 +414,21 @@ pub fn receiveTrustedAddresses(
 
             .answer_rdata => |rdata| {
                 // TODO parser.reader()?
-                var reader = parser.wrapper_reader.reader();
+                // var reader = parser.wrapper_reader.reader();
                 defer current_resource = null;
                 const maybe_addr = switch (current_resource.?.typ) {
                     .A => blk: {
                         var ip4addr: [4]u8 = undefined;
-                        _ = try reader.read(&ip4addr);
+                        _ = try reader.readSliceAll(&ip4addr);
                         break :blk std.net.Address.initIp4(ip4addr, 0);
                     },
                     .AAAA => blk: {
                         var ip6_addr: [16]u8 = undefined;
-                        _ = try reader.read(&ip6_addr);
+                        _ = try reader.readSliceAll(&ip6_addr);
                         break :blk std.net.Address.initIp6(ip6_addr, 0, 0, 0);
                     },
                     else => blk: {
-                        try reader.skipBytes(rdata.size, .{});
+                        reader.toss(rdata.size);
                         break :blk null;
                     },
                 };
@@ -477,13 +472,13 @@ fn fetchTrustedAddresses(
     const conn = try dns.helpers.connectToSystemResolver();
     defer conn.close();
 
-    logger.debug("selected nameserver: {}", .{conn.address});
+    logger.debug("selected nameserver: {f}", .{conn.address});
     try conn.sendPacket(packet);
     return try receiveTrustedAddresses(allocator, &conn, .{});
 }
 
 // implementation taken from std.net address resolution
-fn lookupHosts(addrs: *std.ArrayList(std.net.Address), family: std.posix.sa_family_t, port: u16, name: []const u8) !void {
+fn lookupHosts(addrs: *std.array_list.Managed(std.net.Address), family: std.posix.sa_family_t, port: u16, name: []const u8) !void {
     const file = std.fs.openFileAbsoluteZ("/etc/hosts", .{}) catch |err| switch (err) {
         error.FileNotFound,
         error.NotDir,
@@ -493,15 +488,12 @@ fn lookupHosts(addrs: *std.ArrayList(std.net.Address), family: std.posix.sa_fami
     };
     defer file.close();
 
-    var buffered_reader = std.io.bufferedReader(file.reader());
-    const reader = buffered_reader.reader();
-    var line_buf: [512]u8 = undefined;
-    while (reader.readUntilDelimiterOrEof(&line_buf, '\n') catch |err| switch (err) {
-        error.StreamTooLong => blk: {
-            // Skip to the delimiter in the reader, to fix parsing
-            try reader.skipUntilDelimiterOrEof('\n');
-            // Use the truncated line. A truncated comment or hostname will be handled correctly.
-            break :blk &line_buf;
+    var buffer: [4096]u8 = undefined;
+    var reader = file.reader(&buffer);
+    while (reader.interface.takeDelimiter('\n') catch |err| switch (err) {
+        error.StreamTooLong => {
+            // line too long
+            return error.StreamTooLong;
         },
         else => |e| return e,
     }) |line| {
@@ -544,7 +536,7 @@ pub fn getAddressList(incoming_name: []const u8, port: u16, allocator: std.mem.A
     var name_buffer: [128][]const u8 = undefined;
     const name = try dns.Name.fromString(incoming_name, &name_buffer);
 
-    var final_list = std.ArrayList(std.net.Address).init(allocator);
+    var final_list = std.array_list.Managed(std.net.Address).init(allocator);
     defer final_list.deinit();
 
     const last_label = name.full.labels[name.full.labels.len - 1];

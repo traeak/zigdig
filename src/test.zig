@@ -1,8 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const io = std.io;
-
 const dns = @import("lib.zig");
 const helpers = @import("helpers.zig");
 const Packet = dns.Packet;
@@ -190,21 +188,16 @@ test "serialization of google.com/A (question)" {
 }
 
 fn serialTest(packet: Packet, write_buffer: []u8) ![]u8 {
-    const typ = std.io.FixedBufferStream([]u8);
-    var stream = typ{ .buffer = write_buffer, .pos = 0 };
-
-    const written_bytes = try packet.writeTo(stream.writer());
-    const written_data = stream.getWritten();
-    try std.testing.expectEqual(written_bytes, written_data.len);
-
+    var stream = std.Io.Writer.fixed(write_buffer);
+    try packet.writeTo(&stream);
+    const written_data = write_buffer[0..stream.end];
     return written_data;
 }
 
-const FixedStream = std.io.FixedBufferStream([]const u8);
 fn deserialTest(packet_data: []const u8) !dns.IncomingPacket {
-    var stream = FixedStream{ .buffer = packet_data, .pos = 0 };
+    var stream = std.Io.Reader.fixed(packet_data);
     return try dns.helpers.parseFullPacket(
-        stream.reader(),
+        &stream,
         std.testing.allocator,
         .{},
     );
@@ -220,11 +213,11 @@ test "names have good sizes" {
     var name = try dns.Name.fromString("example.com", &name_buffer);
 
     var buf: [256]u8 = undefined;
-    var stream = std.io.FixedBufferStream([]u8){ .buffer = &buf, .pos = 0 };
-    const network_size = try name.writeTo(stream.writer());
+    var stream = std.Io.Writer.fixed(&buf);
+    try name.writeTo(&stream);
 
     // length + data + length + data + null
-    try testing.expectEqual(@as(usize, 1 + 7 + 1 + 3 + 1), network_size);
+    try testing.expectEqual(@as(usize, 1 + 7 + 1 + 3 + 1), stream.end);
 }
 
 test "resources have good sizes" {
@@ -240,13 +233,13 @@ test "resources have good sizes" {
     };
 
     var buf: [256]u8 = undefined;
-    var stream = std.io.FixedBufferStream([]u8){ .buffer = &buf, .pos = 0 };
-    const network_size = try resource.writeTo(stream.writer());
+    var stream = std.Io.Writer.fixed(&buf);
+    try resource.writeTo(&stream);
 
     // name + rr (2) + class (2) + ttl (4) + rdlength (2)
     try testing.expectEqual(
         @as(usize, name.networkSize() + 10 + resource.opaque_rdata.?.data.len),
-        network_size,
+        stream.end,
     );
 }
 
@@ -262,9 +255,9 @@ test "rdata serialization" {
     };
 
     var opaque_rdata_buffer: [1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&opaque_rdata_buffer);
-    _ = try resource_data.writeTo(stream.writer());
-    const opaque_rdata = stream.getWritten();
+    var stream = std.Io.Writer.fixed(&opaque_rdata_buffer);
+    try resource_data.writeTo(&stream);
+    const opaque_rdata = opaque_rdata_buffer[0..stream.end];
 
     var answers = [_]dns.Resource{.{
         .name = name,

@@ -9,11 +9,12 @@ const logger = std.log.scoped(.dns_parser);
 /// dns.helpers.parseFullPacket, which is a wrapper around the Parser that
 /// allocates everything.
 pub fn parser(
-    reader: anytype,
+    reader: *std.Io.Reader,
     ctx: *ParserContext,
     options: dns.ParserOptions,
-) Parser(@TypeOf(reader)) {
-    return Parser(@TypeOf(reader)).init(reader, ctx, options);
+) Parser() {
+    // TODO clean up Parser() to not receive generic type anymore
+    return Parser().init(reader, ctx, options);
 }
 
 pub const ResourceResolutionOptions = struct {
@@ -57,14 +58,14 @@ pub const ResourceDataHolder = struct {
     size: usize,
     current_byte_index: usize,
 
-    pub fn skip(self: @This(), reader: anytype) !void {
-        try reader.skipBytes(self.size, .{});
+    pub fn skip(self: @This(), reader: *std.Io.Reader) void {
+        reader.toss(self.size);
     }
 
     pub fn readAllAlloc(
         self: @This(),
         allocator: std.mem.Allocator,
-        reader: anytype,
+        reader: *std.Io.Reader,
     ) !dns.ResourceData.Opaque {
         const opaque_rdata = try allocator.alloc(u8, self.size);
         const read_bytes = try reader.read(opaque_rdata);
@@ -151,31 +152,91 @@ pub fn WrapperReader(comptime ReaderType: anytype) type {
     };
 }
 
+pub const WrapperReader2 = struct {
+    underlying_reader: *std.Io.Reader,
+    ctx: *ParserContext,
+    interface: std.Io.Reader,
+
+    const Self = @This();
+
+    pub fn init(reader: *std.Io.Reader, ctx: *ParserContext) Self {
+        return .{
+            .underlying_reader = reader,
+            .ctx = ctx,
+            .interface = initInterface(reader.buffer),
+        };
+    }
+
+    pub fn initInterface(buffer: []u8) std.Io.Reader {
+        return .{
+            .vtable = &.{
+                .stream = WrapperReader2.stream,
+                .discard = WrapperReader2.discard,
+                .readVec = WrapperReader2.readVec,
+            },
+            .buffer = buffer,
+            .seek = 0,
+            .end = 0,
+        };
+    }
+
+    fn stream(io_reader: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Self = @alignCast(@fieldParentPtr("interface", io_reader));
+
+        const bytes_read = try self.underlying_reader.stream(w, limit);
+        self.ctx.current_byte_count += bytes_read;
+        logger.debug(
+            "wrapper reader: read {d} bytes, now at {d}",
+            .{ bytes_read, self.ctx.current_byte_count },
+        );
+        return bytes_read;
+    }
+
+    fn readVec(io_reader: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        const self: *Self = @alignCast(@fieldParentPtr("interface", io_reader));
+
+        const bytes_read = try self.underlying_reader.readVec(data);
+        self.ctx.current_byte_count += bytes_read;
+        logger.debug(
+            "wrapper reader: readVec {d} bytes, now at {d}",
+            .{ bytes_read, self.ctx.current_byte_count },
+        );
+        return bytes_read;
+    }
+
+    fn discard(io_reader: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
+        const self: *Self = @alignCast(@fieldParentPtr("interface", io_reader));
+
+        const bytes_read = try self.underlying_reader.discard(limit);
+        self.ctx.current_byte_count += bytes_read;
+        logger.debug(
+            "wrapper reader: readVec {d} bytes, now at {d}",
+            .{ bytes_read, self.ctx.current_byte_count },
+        );
+        return bytes_read;
+    }
+};
+
 /// Low level parser for DNS packets.
 ///
 /// There are two wrappers for this parser, dns.helpers.parseFullPacket,
 /// and dns.helpers.receiveTrustedAddresses.
-pub fn Parser(comptime ReaderType: type) type {
-    const WrapperR = WrapperReader(ReaderType);
-
+pub fn Parser() type {
     return struct {
         state: ParserState = .header,
-        wrapper_reader: WrapperR,
+        wrapper_reader: *std.Io.Reader,
         options: ParserOptions,
         ctx: *ParserContext,
 
         const Self = @This();
 
         pub fn init(
-            incoming_reader: ReaderType,
+            incoming_reader: *std.Io.Reader,
             ctx: *ParserContext,
             options: ParserOptions,
         ) Self {
             const self = Self{
-                .wrapper_reader = WrapperR{
-                    .underlying_reader = incoming_reader,
-                    .ctx = ctx,
-                },
+                .wrapper_reader = incoming_reader,
                 .options = options,
                 .ctx = ctx,
             };
@@ -191,10 +252,10 @@ pub fn Parser(comptime ReaderType: type) type {
 
             logger.debug(
                 "parser reader is at {d} bytes of message",
-                .{self.wrapper_reader.ctx.current_byte_count},
+                .{self.wrapper_reader.seek},
             );
 
-            var reader = self.wrapper_reader.reader();
+            var reader = self.wrapper_reader;
 
             switch (self.state) {
                 .header => {
@@ -306,8 +367,8 @@ pub fn Parser(comptime ReaderType: type) type {
                         else => unreachable,
                     };
 
-                    const rdata_length = try reader.readInt(u16, .big);
-                    const rdata_index = reader.context.ctx.current_byte_count;
+                    const rdata_length = try reader.takeInt(u16, .big);
+                    const rdata_index = reader.seek;
                     const rdata = ResourceDataHolder{
                         .size = rdata_length,
                         .current_byte_index = rdata_index,

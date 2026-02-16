@@ -30,7 +30,7 @@ pub const SRVData = struct {
 };
 
 fn maybeReadResourceName(
-    reader: anytype,
+    reader: *std.Io.Reader,
     options: ResourceData.ParseOptions,
 ) !?dns.Name {
     return switch (options.name_provider) {
@@ -110,21 +110,13 @@ pub const ResourceData = union(Type) {
     ///
     /// For example, a resource data of type A would be
     /// formatted to its representing IPv4 address.
-    pub fn format(
-        self: Self,
-        comptime f: []const u8,
-        options: fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = f;
-        _ = options;
-
+    pub fn format(self: Self, writer: anytype) std.Io.Writer.Error!void {
         switch (self) {
-            .A, .AAAA => |addr| return fmt.format(writer, "{}", .{addr}),
+            .A, .AAAA => |addr| return writer.print("{}", .{addr}),
 
-            .NS, .MD, .MF, .MB, .MG, .MR, .CNAME, .PTR => |name| return fmt.format(writer, "{?}", .{name}),
+            .NS, .MD, .MF, .MB, .MG, .MR, .CNAME, .PTR => |name| return writer.print("{?}", .{name}),
 
-            .SOA => |soa| return fmt.format(writer, "{?} {?} {} {} {} {} {}", .{
+            .SOA => |soa| return writer.print("{?} {?} {} {} {} {} {}", .{
                 soa.mname,
                 soa.rname,
                 soa.serial,
@@ -134,32 +126,32 @@ pub const ResourceData = union(Type) {
                 soa.minimum,
             }),
 
-            .MX => |mx| return fmt.format(writer, "{} {?}", .{ mx.preference, mx.exchange }),
-            .SRV => |srv| return fmt.format(writer, "{} {} {} {?}", .{
+            .MX => |mx| return writer.print("{} {?}", .{ mx.preference, mx.exchange }),
+            .SRV => |srv| return writer.print("{} {} {} {?}", .{
                 srv.priority,
                 srv.weight,
                 srv.port,
                 srv.target,
             }),
 
-            .TXT => |text| return fmt.format(writer, "{?s}", .{text}),
-            else => return fmt.format(writer, "TODO support {s}", .{@tagName(self)}),
+            .TXT => |text| return writer.print("{?s}", .{text}),
+            else => return writer.print("TODO support {s}", .{@tagName(self)}),
         }
     }
 
-    pub fn writeTo(self: Self, writer: anytype) !usize {
+    pub fn writeTo(self: Self, writer: *std.Io.Writer) !void {
         return switch (self) {
-            .A => |addr| blk: {
+            .A => |addr| {
                 try writer.writeInt(u32, addr.in.sa.addr, .big);
-                break :blk @sizeOf(@TypeOf(addr.in.sa.addr));
+                // break :blk @sizeOf(@TypeOf(addr.in.sa.addr));
             },
-            .AAAA => |addr| try writer.write(&addr.in6.sa.addr),
+            .AAAA => |addr| _ = try writer.write(&addr.in6.sa.addr),
 
             .NS, .MD, .MF, .MB, .MG, .MR, .CNAME, .PTR => |name| try name.?.writeTo(writer),
 
-            .SOA => |soa_data| blk: {
-                const mname_size = try soa_data.mname.?.writeTo(writer);
-                const rname_size = try soa_data.rname.?.writeTo(writer);
+            .SOA => |soa_data| {
+                try soa_data.mname.?.writeTo(writer);
+                try soa_data.rname.?.writeTo(writer);
 
                 try writer.writeInt(u32, soa_data.serial, .big);
                 try writer.writeInt(u32, soa_data.refresh, .big);
@@ -167,13 +159,12 @@ pub const ResourceData = union(Type) {
                 try writer.writeInt(u32, soa_data.expire, .big);
                 try writer.writeInt(u32, soa_data.minimum, .big);
 
-                break :blk mname_size + rname_size + (5 * @sizeOf(u32));
+                // break :blk mname_size + rname_size + (5 * @sizeOf(u32));
             },
 
-            .MX => |mxdata| blk: {
+            .MX => |mxdata| {
                 try writer.writeInt(u16, mxdata.preference, .big);
-                const exchange_size = try mxdata.exchange.?.writeTo(writer);
-                break :blk @sizeOf(@TypeOf(mxdata.preference)) + exchange_size;
+                try mxdata.exchange.?.writeTo(writer);
             },
 
             .SRV => |srv| {
@@ -181,8 +172,7 @@ pub const ResourceData = union(Type) {
                 try writer.writeInt(u16, srv.weight, .big);
                 try writer.writeInt(u16, srv.port, .big);
 
-                const target_size = try srv.target.?.writeTo(writer);
-                return target_size + (3 * @sizeOf(u16));
+                try srv.target.?.writeTo(writer);
             },
 
             // TODO TXT
@@ -229,9 +219,7 @@ pub const ResourceData = union(Type) {
         opaque_resource_data: Opaque,
         options: ParseOptions,
     ) !ResourceData {
-        const BufferT = std.io.FixedBufferStream([]const u8);
-        var stream = BufferT{ .buffer = opaque_resource_data.data, .pos = 0 };
-        const underlying_reader = stream.reader();
+        var underlying_reader = std.Io.Reader.fixed(opaque_resource_data.data);
 
         // important to keep track of that rdata's position in the packet
         // as rdata could point to other rdata.
@@ -239,24 +227,23 @@ pub const ResourceData = union(Type) {
             .current_byte_count = opaque_resource_data.current_byte_count,
         };
 
-        const WrapperR = dns.parserlib.WrapperReader(BufferT.Reader);
-        var wrapper_reader = WrapperR{
-            .underlying_reader = underlying_reader,
-            .ctx = &parser_ctx,
-        };
-        var reader = wrapper_reader.reader();
+        var wrapper_reader = dns.parserlib.WrapperReader2.init(
+            &underlying_reader,
+            &parser_ctx,
+        );
+        var reader = &wrapper_reader.interface;
 
         return switch (resource_type) {
             .A => blk: {
                 var ip4addr: [4]u8 = undefined;
-                _ = try reader.read(&ip4addr);
+                try reader.readSliceAll(&ip4addr);
                 break :blk ResourceData{
                     .A = std.net.Address.initIp4(ip4addr, 0),
                 };
             },
             .AAAA => blk: {
                 var ip6_addr: [16]u8 = undefined;
-                _ = try reader.read(&ip6_addr);
+                try reader.readSliceAll(&ip6_addr);
                 break :blk ResourceData{
                     .AAAA = std.net.Address.initIp6(ip6_addr, 0, 0, 0),
                 };
@@ -271,7 +258,7 @@ pub const ResourceData = union(Type) {
             .MX => blk: {
                 break :blk ResourceData{
                     .MX = MXData{
-                        .preference = try reader.readInt(u16, .big),
+                        .preference = try reader.takeInt(u16, .big),
                         .exchange = try maybeReadResourceName(reader, options),
                     },
                 };
@@ -280,11 +267,11 @@ pub const ResourceData = union(Type) {
             .SOA => blk: {
                 const mname = try maybeReadResourceName(reader, options);
                 const rname = try maybeReadResourceName(reader, options);
-                const serial = try reader.readInt(u32, .big);
-                const refresh = try reader.readInt(u32, .big);
-                const retry = try reader.readInt(u32, .big);
-                const expire = try reader.readInt(u32, .big);
-                const minimum = try reader.readInt(u32, .big);
+                const serial = try reader.takeInt(u32, .big);
+                const refresh = try reader.takeInt(u32, .big);
+                const retry = try reader.takeInt(u32, .big);
+                const expire = try reader.takeInt(u32, .big);
+                const minimum = try reader.takeInt(u32, .big);
 
                 break :blk ResourceData{
                     .SOA = SOAData{
@@ -299,9 +286,9 @@ pub const ResourceData = union(Type) {
                 };
             },
             .SRV => blk: {
-                const priority = try reader.readInt(u16, .big);
-                const weight = try reader.readInt(u16, .big);
-                const port = try reader.readInt(u16, .big);
+                const priority = try reader.takeInt(u16, .big);
+                const weight = try reader.takeInt(u16, .big);
+                const port = try reader.takeInt(u16, .big);
                 const target = try maybeReadResourceName(reader, options);
                 break :blk ResourceData{
                     .SRV = .{
@@ -313,16 +300,15 @@ pub const ResourceData = union(Type) {
                 };
             },
             .TXT => blk: {
-                const length = try reader.readInt(u8, .big);
+                const length = try reader.takeInt(u8, .big);
                 if (length > 256) return error.Overflow;
 
                 if (options.allocator) |allocator| {
                     const text = try allocator.alloc(u8, length);
-                    _ = try reader.read(text);
-
+                    try reader.readSliceAll(text);
                     break :blk ResourceData{ .TXT = text };
                 } else {
-                    try reader.skipBytes(length, .{});
+                    reader.toss(length);
                     break :blk ResourceData{ .TXT = null };
                 }
             },
