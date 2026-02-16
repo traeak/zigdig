@@ -96,51 +96,55 @@ const bitWriter = struct {
 ///
 /// https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.1
 pub const Header = packed struct {
-    /// The ID of the packet. Replies to a packet MUST have the same ID.
-    id: u16 = 0,
+    // NOTE: Fields are in reverse order because Zig packed structs place
+    // the first field at the LSB. When serialized big-endian via writeStruct,
+    // the last field here (id) ends up first on the wire, matching DNS format.
 
-    /// Query/Response flag
-    /// Defines if this is a response packet or not.
-    is_response: bool = false,
+    /// Amount of additional records in the packet.
+    additional_length: u16 = 0,
 
-    /// specifies kind of query in this message.
-    opcode: OpCode = .Query,
+    /// Amount of nameservers in the packet.
+    nameserver_length: u16 = 0,
 
-    /// Authoritative Answer flag
-    /// Only valid in response packets. Specifies if the server
-    /// replying is an authority for the domain name.
-    aa_flag: bool = false,
+    /// Amount of answers in the packet.
+    answer_length: u16 = 0,
 
-    /// TC flag - TrunCation.
-    /// If the packet was truncated.
-    truncated: bool = false,
+    /// Amount of questions in the packet.
+    question_length: u16 = 0,
+
+    /// Response code.
+    response_code: ResponseCode = .NoError,
+
+    /// DO NOT USE. RFC1035 has not assigned anything to the Z bits
+    z: u3 = 0,
+
+    /// RA flag - Recursion Available
+    /// Whether recursive query support is available on the server.
+    recursion_available: bool = false,
 
     /// RD flag - Recursion Desired.
     /// Must be copied to a response packet. If set, the server
     /// handling the request can pursue the query recursively.
     wanted_recursion: bool = false,
 
-    /// RA flag - Recursion Available
-    /// Whether recursive query support is available on the server.
-    recursion_available: bool = false,
+    /// TC flag - TrunCation.
+    /// If the packet was truncated.
+    truncated: bool = false,
 
-    /// DO NOT USE. RFC1035 has not assigned anything to the Z bits
-    z: u3 = 0,
+    /// Authoritative Answer flag
+    /// Only valid in response packets. Specifies if the server
+    /// replying is an authority for the domain name.
+    aa_flag: bool = false,
 
-    /// Response code.
-    response_code: ResponseCode = .NoError,
+    /// specifies kind of query in this message.
+    opcode: OpCode = .Query,
 
-    /// Amount of questions in the packet.
-    question_length: u16 = 0,
+    /// Query/Response flag
+    /// Defines if this is a response packet or not.
+    is_response: bool = false,
 
-    /// Amount of answers in the packet.
-    answer_length: u16 = 0,
-
-    /// Amount of nameservers in the packet.
-    nameserver_length: u16 = 0,
-
-    /// Amount of additional records in the packet.
-    additional_length: u16 = 0,
+    /// The ID of the packet. Replies to a packet MUST have the same ID.
+    id: u16 = 0,
 
     const Self = @This();
 
