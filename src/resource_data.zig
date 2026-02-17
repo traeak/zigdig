@@ -112,11 +112,11 @@ pub const ResourceData = union(Type) {
     /// formatted to its representing IPv4 address.
     pub fn format(self: Self, writer: anytype) std.Io.Writer.Error!void {
         switch (self) {
-            .A, .AAAA => |addr| return writer.print("{}", .{addr}),
+            .A, .AAAA => |addr| return writer.print("{f}", .{addr}),
 
-            .NS, .MD, .MF, .MB, .MG, .MR, .CNAME, .PTR => |name| return writer.print("{?}", .{name}),
+            .NS, .MD, .MF, .MB, .MG, .MR, .CNAME, .PTR => |name| return writer.print("{?f}", .{name}),
 
-            .SOA => |soa| return writer.print("{?} {?} {} {} {} {} {}", .{
+            .SOA => |soa| return writer.print("{?f} {?f} {} {} {} {} {}", .{
                 soa.mname,
                 soa.rname,
                 soa.serial,
@@ -126,8 +126,8 @@ pub const ResourceData = union(Type) {
                 soa.minimum,
             }),
 
-            .MX => |mx| return writer.print("{} {?}", .{ mx.preference, mx.exchange }),
-            .SRV => |srv| return writer.print("{} {} {} {?}", .{
+            .MX => |mx| return writer.print("{} {?f}", .{ mx.preference, mx.exchange }),
+            .SRV => |srv| return writer.print("{} {} {} {?f}", .{
                 srv.priority,
                 srv.weight,
                 srv.port,

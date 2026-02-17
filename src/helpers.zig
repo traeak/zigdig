@@ -27,8 +27,8 @@ fn printList(
             else => {}, // names are owned by given NamePool
         };
 
-        try writer.print("{?}\t\t{s}\t{s}\t{d}\t{any}\n", .{
-            resource.name.?,
+        try writer.print("{?f}\t\t{s}\t{s}\t{d}\t{f}\n", .{
+            resource.name,
             @tagName(resource.typ),
             @tagName(resource.class),
             resource.ttl,

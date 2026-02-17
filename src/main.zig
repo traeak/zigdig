@@ -122,5 +122,6 @@ pub fn main() !void {
     try std.testing.expectEqual(packet.header.id, reply_packet.header.id);
     try std.testing.expect(reply_packet.header.is_response);
 
-    try dns.helpers.printAsZoneFile(reply_packet, &name_pool, stdout.writer());
+    try dns.helpers.printAsZoneFile(reply_packet, &name_pool, &stdout.interface);
+    try stdout.interface.flush();
 }
