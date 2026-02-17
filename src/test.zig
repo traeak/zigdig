@@ -297,6 +297,117 @@ test "localhost always resolves to 127.0.0.1" {
     try std.testing.expectEqualStrings("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", &addrs.addrs[0].in6.sa.addr);
 }
 
+test "NS records with cross-rdata pointer compression" {
+    // Simulates a response for "l4.pm NS" with two NS records:
+    //   - coco.bunny.net. (full name in rdata)
+    //   - kiki.bunny.net. (uses pointer to "bunny.net." in first rdata)
+    //
+    // Packet layout:
+    //   offset  0: header (12 bytes)
+    //   offset 12: question name \x02l4\x02pm\x00 (7 bytes)
+    //   offset 19: question type/class (4 bytes)
+    //   offset 23: answer 1 header (name ptr + type + class + ttl + rdlength = 12 bytes)
+    //   offset 35: answer 1 rdata: \x04coco\x05bunny\x03net\x00 (16 bytes)
+    //   offset 51: answer 2 header (12 bytes)
+    //   offset 63: answer 2 rdata: \x04kiki\xC0\x28 (7 bytes)
+    //                                        ^ pointer to offset 40 = "bunny.net." in answer 1 rdata
+    const packet_bytes = [_]u8{
+        // Header
+        0x12, 0x34, // ID
+        0x81, 0x80, // Flags: response, recursion desired+available
+        0x00, 0x01, // QDCOUNT: 1
+        0x00, 0x02, // ANCOUNT: 2
+        0x00, 0x00, // NSCOUNT: 0
+        0x00, 0x00, // ARCOUNT: 0
+
+        // Question: l4.pm IN NS
+        0x02, 'l',
+        '4',  0x02,
+        'p',  'm',
+        0x00,
+        0x00, 0x02, // Type NS
+        0x00, 0x01, // Class IN
+
+        // Answer 1: l4.pm NS coco.bunny.net.
+        0xC0, 0x0C, // Name: pointer to offset 12 (l4.pm)
+        0x00, 0x02, // Type NS
+        0x00, 0x01, // Class IN
+        0x00, 0x00, 0x0E, 0x10, // TTL 3600
+        0x00, 0x10, // RDLENGTH 16
+        0x04, 'c',
+        'o',  'c',
+        'o',  0x05,
+        'b',  'u',
+        'n',  'n',
+        'y',  0x03,
+        'n',  'e',
+        't',
+        0x00,
+
+        // Answer 2: l4.pm NS kiki.bunny.net.
+        0xC0, 0x0C, // Name: pointer to offset 12 (l4.pm)
+        0x00, 0x02, // Type NS
+        0x00, 0x01, // Class IN
+        0x00, 0x00, 0x0E, 0x10, // TTL 3600
+        0x00, 0x07, // RDLENGTH 7
+        0x04, 'k',
+        'i',  'k',
+        'i',
+        0xC0, 0x28, // pointer to offset 40 (bunny.net.)
+    };
+
+    var stream = std.Io.Reader.fixed(&packet_bytes);
+    var name_pool = dns.NamePool.init(std.testing.allocator);
+    defer name_pool.deinitWithNames();
+
+    var incoming = try dns.helpers.parseFullPacket(
+        &stream,
+        std.testing.allocator,
+        .{ .name_pool = &name_pool },
+    );
+    defer incoming.deinit(.{ .names = false });
+
+    const pkt = incoming.packet;
+
+    // Verify basic structure
+    try std.testing.expectEqual(@as(u16, 2), pkt.header.answer_length);
+    try std.testing.expectEqual(@as(usize, 2), pkt.answers.len);
+
+    // Parse both NS rdata records through the name pool
+    const ns1 = try dns.ResourceData.fromOpaque(
+        .NS,
+        pkt.answers[0].opaque_rdata.?,
+        .{
+            .name_provider = .{ .full = &name_pool },
+            .allocator = std.testing.allocator,
+        },
+    );
+
+    const ns2 = try dns.ResourceData.fromOpaque(
+        .NS,
+        pkt.answers[1].opaque_rdata.?,
+        .{
+            .name_provider = .{ .full = &name_pool },
+            .allocator = std.testing.allocator,
+        },
+    );
+
+    // Verify first NS record: coco.bunny.net.
+    const ns1_name = ns1.NS.?.full;
+    try std.testing.expectEqual(@as(usize, 3), ns1_name.labels.len);
+    try std.testing.expectEqualStrings("coco", ns1_name.labels[0]);
+    try std.testing.expectEqualStrings("bunny", ns1_name.labels[1]);
+    try std.testing.expectEqualStrings("net", ns1_name.labels[2]);
+
+    // Verify second NS record: kiki.bunny.net.
+    // This is the critical test - "bunny.net." comes from pointer compression
+    const ns2_name = ns2.NS.?.full;
+    try std.testing.expectEqual(@as(usize, 3), ns2_name.labels.len);
+    try std.testing.expectEqualStrings("kiki", ns2_name.labels[0]);
+    try std.testing.expectEqualStrings("bunny", ns2_name.labels[1]);
+    try std.testing.expectEqualStrings("net", ns2_name.labels[2]);
+}
+
 test "everything" {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(@import("name.zig"));
