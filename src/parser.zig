@@ -130,7 +130,7 @@ pub const DeserializationContext = struct {
 ///
 /// This is necessary for DNS name resolution, as name offset can reference
 /// anywhere in the packet.
-pub const WrapperReader2 = struct {
+pub const WrapperReader = struct {
     underlying_reader: *std.Io.Reader,
     ctx: *ParserContext,
     interface: std.Io.Reader,
@@ -144,7 +144,7 @@ pub const WrapperReader2 = struct {
             .ctx = ctx,
             .interface = .{
                 .vtable = &.{
-                    .stream = WrapperReader2.stream,
+                    .stream = WrapperReader.stream,
                 },
                 // buffer will be set by fixupBuffer after move
                 .buffer = undefined,

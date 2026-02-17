@@ -227,7 +227,7 @@ pub const ResourceData = union(Type) {
             .current_byte_count = opaque_resource_data.current_byte_count,
         };
 
-        var wrapper_reader = dns.parserlib.WrapperReader2.init(
+        var wrapper_reader = dns.parserlib.WrapperReader.init(
             &underlying_reader,
             &parser_ctx,
         );
