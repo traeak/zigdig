@@ -3,20 +3,6 @@ const dns = @import("lib.zig");
 
 const logger = std.log.scoped(.dns_parser);
 
-/// Create a Parser object out of a reader, context, and options.
-///
-/// If you do not wish to have full control over deserialization, look at
-/// dns.helpers.parseFullPacket, which is a wrapper around the Parser that
-/// allocates everything.
-pub fn parser(
-    reader: *std.Io.Reader,
-    ctx: *ParserContext,
-    options: dns.ParserOptions,
-) Parser {
-    // TODO clean up Parser() to not receive generic type anymore
-    return Parser.init(reader, ctx, options);
-}
-
 pub const ResourceResolutionOptions = struct {
     max_follow: usize = 32,
 };
@@ -175,10 +161,14 @@ pub const WrapperReader = struct {
     }
 };
 
-/// Low level parser for DNS packets.
+/// Low level parser for DNS packets. Create with `dns.Parser.init()`.
 ///
-/// There are two wrappers for this parser, dns.helpers.parseFullPacket,
-/// and dns.helpers.receiveTrustedAddresses.
+/// If you do not wish to have full control over deserialization, look at
+/// `dns.helpers.parseFullPacket`, which is a wrapper around the Parser that
+/// allocates all the necessary memory.
+///
+/// If you do not wish to allocate, there is `dns.helpers.receiveTrustedAddresses`
+/// which only returns a list of `std.net.Address`, useful for domain lookups.
 pub const Parser = struct {
     state: ParserState = .header,
     wrapper_reader: *std.Io.Reader,
