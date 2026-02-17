@@ -231,6 +231,7 @@ pub const ResourceData = union(Type) {
             &underlying_reader,
             &parser_ctx,
         );
+        wrapper_reader.fixupBuffer();
         var reader = &wrapper_reader.interface;
 
         return switch (resource_type) {

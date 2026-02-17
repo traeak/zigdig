@@ -120,42 +120,21 @@ pub const DeserializationContext = struct {
     current_byte_count: usize = 0,
 };
 
-/// Wrap a Reader with a type that contains a DeserializationContext.
+/// Wrap an std.io.Reader with a DeserializationContext.
 ///
-/// Automatically increments the DeserializationContext's current_byte_count
+/// Automatically increments the DeserializationContext's `current_byte_count`
 /// on every read().
 ///
 /// Useful to hold deserialization state without having to pass an entire
 /// parameter around on every single helper function.
-pub fn WrapperReader(comptime ReaderType: anytype) type {
-    return struct {
-        underlying_reader: ReaderType,
-        ctx: *ParserContext,
-
-        const Self = @This();
-
-        pub fn read(self: *Self, buffer: []u8) !usize {
-            const bytes_read = try self.underlying_reader.read(buffer);
-            self.ctx.current_byte_count += bytes_read;
-            logger.debug(
-                "wrapper reader: read {d} bytes, now at {d}",
-                .{ bytes_read, self.ctx.current_byte_count },
-            );
-            return bytes_read;
-        }
-
-        pub const Error = ReaderType.Error;
-        pub const Reader = std.io.Reader(*Self, Error, read);
-        pub fn reader(self: *Self) Reader {
-            return Reader{ .context = self };
-        }
-    };
-}
-
+///
+/// This is necessary for DNS name resolution, as name offset can reference
+/// anywhere in the packet.
 pub const WrapperReader2 = struct {
     underlying_reader: *std.Io.Reader,
     ctx: *ParserContext,
     interface: std.Io.Reader,
+    own_buffer: [4096]u8 = undefined,
 
     const Self = @This();
 
@@ -163,21 +142,24 @@ pub const WrapperReader2 = struct {
         return .{
             .underlying_reader = reader,
             .ctx = ctx,
-            .interface = initInterface(reader.buffer),
+            .interface = .{
+                .vtable = &.{
+                    .stream = WrapperReader2.stream,
+                },
+                // buffer will be set by fixupBuffer after move
+                .buffer = undefined,
+                .seek = 0,
+                .end = 0,
+            },
         };
     }
 
-    pub fn initInterface(buffer: []u8) std.Io.Reader {
-        return .{
-            .vtable = &.{
-                .stream = WrapperReader2.stream,
-                .discard = WrapperReader2.discard,
-                .readVec = WrapperReader2.readVec,
-            },
-            .buffer = buffer,
-            .seek = 0,
-            .end = 0,
-        };
+    /// Must be called after init to fix up the internal buffer pointer.
+    /// This is needed because init returns by value, which invalidates
+    /// the self-referential pointer.
+    pub fn fixupBuffer(self: *Self) void {
+        // TODO maybe there's a better way for this? i'm not good at Zig interfaces
+        self.interface.buffer = &self.own_buffer;
     }
 
     fn stream(io_reader: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
@@ -187,30 +169,6 @@ pub const WrapperReader2 = struct {
         self.ctx.current_byte_count += bytes_read;
         logger.debug(
             "wrapper reader: read {d} bytes, now at {d}",
-            .{ bytes_read, self.ctx.current_byte_count },
-        );
-        return bytes_read;
-    }
-
-    fn readVec(io_reader: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
-        const self: *Self = @alignCast(@fieldParentPtr("interface", io_reader));
-
-        const bytes_read = try self.underlying_reader.readVec(data);
-        self.ctx.current_byte_count += bytes_read;
-        logger.debug(
-            "wrapper reader: readVec {d} bytes, now at {d}",
-            .{ bytes_read, self.ctx.current_byte_count },
-        );
-        return bytes_read;
-    }
-
-    fn discard(io_reader: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
-        const self: *Self = @alignCast(@fieldParentPtr("interface", io_reader));
-
-        const bytes_read = try self.underlying_reader.discard(limit);
-        self.ctx.current_byte_count += bytes_read;
-        logger.debug(
-            "wrapper reader: readVec {d} bytes, now at {d}",
             .{ bytes_read, self.ctx.current_byte_count },
         );
         return bytes_read;
