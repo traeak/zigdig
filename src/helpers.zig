@@ -162,7 +162,7 @@ pub const DNSConnection = struct {
         const packet_bytes = packet_buffer[0..read_bytes];
         logger.debug("read {d} bytes", .{read_bytes});
 
-        var stream = std.io.Reader.fixed(packet_bytes);
+        var stream = std.Io.Reader.fixed(packet_bytes);
         return parseFullPacket(&stream, packet_allocator, options);
     }
 };
