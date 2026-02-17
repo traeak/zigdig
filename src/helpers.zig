@@ -413,8 +413,6 @@ pub fn receiveTrustedAddresses(
             },
 
             .answer_rdata => |rdata| {
-                // TODO parser.reader()?
-                // var reader = parser.wrapper_reader.reader();
                 defer current_resource = null;
                 const maybe_addr = switch (current_resource.?.typ) {
                     .A => blk: {
