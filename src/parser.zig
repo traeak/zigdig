@@ -12,9 +12,9 @@ pub fn parser(
     reader: *std.Io.Reader,
     ctx: *ParserContext,
     options: dns.ParserOptions,
-) Parser() {
+) Parser {
     // TODO clean up Parser() to not receive generic type anymore
-    return Parser().init(reader, ctx, options);
+    return Parser.init(reader, ctx, options);
 }
 
 pub const ResourceResolutionOptions = struct {
@@ -179,169 +179,167 @@ pub const WrapperReader = struct {
 ///
 /// There are two wrappers for this parser, dns.helpers.parseFullPacket,
 /// and dns.helpers.receiveTrustedAddresses.
-pub fn Parser() type {
-    return struct {
-        state: ParserState = .header,
-        wrapper_reader: *std.Io.Reader,
-        options: ParserOptions,
+pub const Parser = struct {
+    state: ParserState = .header,
+    wrapper_reader: *std.Io.Reader,
+    options: ParserOptions,
+    ctx: *ParserContext,
+
+    const Self = @This();
+
+    pub fn init(
+        incoming_reader: *std.Io.Reader,
         ctx: *ParserContext,
+        options: ParserOptions,
+    ) Self {
+        const self = Self{
+            .wrapper_reader = incoming_reader,
+            .options = options,
+            .ctx = ctx,
+        };
 
-        const Self = @This();
+        return self;
+    }
 
-        pub fn init(
-            incoming_reader: *std.Io.Reader,
-            ctx: *ParserContext,
-            options: ParserOptions,
-        ) Self {
-            const self = Self{
-                .wrapper_reader = incoming_reader,
-                .options = options,
-                .ctx = ctx,
-            };
+    /// Receive the next frame from the parser.
+    pub fn next(self: *Self) !?ParserFrame {
+        // self.state dictates what we *want* from the reader
+        // at the moment, first state always being header.
+        logger.debug("next(): enter {}", .{self.state});
 
-            return self;
-        }
+        logger.debug(
+            "parser reader is at {d} bytes of message",
+            .{self.wrapper_reader.seek},
+        );
 
-        /// Receive the next frame from the parser.
-        pub fn next(self: *Self) !?ParserFrame {
-            // self.state dictates what we *want* from the reader
-            // at the moment, first state always being header.
-            logger.debug("next(): enter {}", .{self.state});
+        var reader = self.wrapper_reader;
 
-            logger.debug(
-                "parser reader is at {d} bytes of message",
-                .{self.wrapper_reader.seek},
-            );
+        switch (self.state) {
+            .header => {
+                // since header is constant size, store it
+                // in our parser state so we know how to continue
+                const header = try dns.Header.readFrom(reader);
+                self.ctx.header = header;
+                self.state = .question;
+                logger.debug(
+                    "next(): header read ({?}). state is now {}",
+                    .{ self.ctx.header, self.state },
+                );
+                return ParserFrame{ .header = header };
+            },
+            .question => {
+                logger.debug("next(): read {d} out of {d} questions", .{
+                    self.ctx.current_counts.question,
+                    self.ctx.header.?.question_length,
+                });
 
-            var reader = self.wrapper_reader;
+                self.ctx.current_counts.question += 1;
 
-            switch (self.state) {
-                .header => {
-                    // since header is constant size, store it
-                    // in our parser state so we know how to continue
-                    const header = try dns.Header.readFrom(reader);
-                    self.ctx.header = header;
-                    self.state = .question;
-                    logger.debug(
-                        "next(): header read ({?}). state is now {}",
-                        .{ self.ctx.header, self.state },
-                    );
-                    return ParserFrame{ .header = header };
-                },
-                .question => {
-                    logger.debug("next(): read {d} out of {d} questions", .{
-                        self.ctx.current_counts.question,
-                        self.ctx.header.?.question_length,
-                    });
+                if (self.ctx.current_counts.question > self.ctx.header.?.question_length) {
+                    self.state = .answer;
+                    logger.debug("parser: end question, go to resources", .{});
+                    return ParserFrame{ .end_question = {} };
+                } else {
+                    const raw_question = try dns.Question.readFrom(reader, self.options);
+                    return ParserFrame{ .question = raw_question };
+                }
+            },
+            .answer, .nameserver, .additional => {
+                const count_holder = (switch (self.state) {
+                    .answer => &self.ctx.current_counts.answer,
+                    .nameserver => &self.ctx.current_counts.nameserver,
+                    .additional => &self.ctx.current_counts.additional,
+                    else => unreachable,
+                });
 
-                    self.ctx.current_counts.question += 1;
+                const header_count = switch (self.state) {
+                    .answer => self.ctx.header.?.answer_length,
+                    .nameserver => self.ctx.header.?.nameserver_length,
+                    .additional => self.ctx.header.?.additional_length,
+                    else => unreachable,
+                };
 
-                    if (self.ctx.current_counts.question > self.ctx.header.?.question_length) {
-                        self.state = .answer;
-                        logger.debug("parser: end question, go to resources", .{});
-                        return ParserFrame{ .end_question = {} };
-                    } else {
-                        const raw_question = try dns.Question.readFrom(reader, self.options);
-                        return ParserFrame{ .question = raw_question };
-                    }
-                },
-                .answer, .nameserver, .additional => {
-                    const count_holder = (switch (self.state) {
-                        .answer => &self.ctx.current_counts.answer,
-                        .nameserver => &self.ctx.current_counts.nameserver,
-                        .additional => &self.ctx.current_counts.additional,
-                        else => unreachable,
-                    });
+                logger.debug("next(): read {d} out of {d} resources", .{
+                    count_holder.*, header_count,
+                });
 
-                    const header_count = switch (self.state) {
-                        .answer => self.ctx.header.?.answer_length,
-                        .nameserver => self.ctx.header.?.nameserver_length,
-                        .additional => self.ctx.header.?.additional_length,
-                        else => unreachable,
-                    };
+                count_holder.* += 1;
 
-                    logger.debug("next(): read {d} out of {d} resources", .{
-                        count_holder.*, header_count,
-                    });
-
-                    count_holder.* += 1;
-
-                    if (count_holder.* > header_count) {
-                        const old_state = self.state;
-                        self.state = switch (self.state) {
-                            .answer => .nameserver,
-                            .nameserver => .additional,
-                            .additional => .done,
-                            else => unreachable,
-                        };
-
-                        logger.debug(
-                            "end resource list. state transition {} -> {}",
-                            .{ old_state, self.state },
-                        );
-
-                        return switch (old_state) {
-                            .answer => ParserFrame{ .end_answer = {} },
-                            .nameserver => ParserFrame{ .end_nameserver = {} },
-                            .additional => ParserFrame{ .end_additional = {} },
-                            else => unreachable,
-                        };
-                    } else {
-                        const raw_resource = try dns.Resource.readFrom(reader, self.options);
-
-                        // not at end yet, which means resource_rdata event
-                        // must happen if we don't have allocator
-
-                        const old_state = self.state;
-
-                        // if we don't have allocator, we emit rdata records
-                        if (self.options.allocator == null) {
-                            self.state = switch (self.state) {
-                                .answer => .answer_rdata,
-                                .nameserver => .nameserver_rdata,
-                                .additional => .additional_rdata,
-                                else => unreachable,
-                            };
-                        }
-
-                        logger.debug("resource from {}: {}", .{ old_state, raw_resource });
-
-                        return switch (old_state) {
-                            .answer => ParserFrame{ .answer = raw_resource },
-                            .nameserver => ParserFrame{ .nameserver = raw_resource },
-                            .additional => ParserFrame{ .additional = raw_resource },
-                            else => unreachable,
-                        };
-                    }
-                },
-
-                .answer_rdata, .nameserver_rdata, .additional_rdata => {
+                if (count_holder.* > header_count) {
                     const old_state = self.state;
-
                     self.state = switch (self.state) {
-                        .answer_rdata => .answer,
-                        .nameserver_rdata => .nameserver,
-                        .additional_rdata => .additional,
+                        .answer => .nameserver,
+                        .nameserver => .additional,
+                        .additional => .done,
                         else => unreachable,
                     };
 
-                    const rdata_length = try reader.takeInt(u16, .big);
-                    const rdata_index = reader.seek;
-                    const rdata = ResourceDataHolder{
-                        .size = rdata_length,
-                        .current_byte_index = rdata_index,
-                    };
+                    logger.debug(
+                        "end resource list. state transition {} -> {}",
+                        .{ old_state, self.state },
+                    );
 
                     return switch (old_state) {
-                        .answer_rdata => ParserFrame{ .answer_rdata = rdata },
-                        .nameserver_rdata => ParserFrame{ .nameserver_rdata = rdata },
-                        .additional_rdata => ParserFrame{ .additional_rdata = rdata },
+                        .answer => ParserFrame{ .end_answer = {} },
+                        .nameserver => ParserFrame{ .end_nameserver = {} },
+                        .additional => ParserFrame{ .end_additional = {} },
                         else => unreachable,
                     };
-                },
+                } else {
+                    const raw_resource = try dns.Resource.readFrom(reader, self.options);
 
-                .done => return null,
-            }
+                    // not at end yet, which means resource_rdata event
+                    // must happen if we don't have allocator
+
+                    const old_state = self.state;
+
+                    // if we don't have allocator, we emit rdata records
+                    if (self.options.allocator == null) {
+                        self.state = switch (self.state) {
+                            .answer => .answer_rdata,
+                            .nameserver => .nameserver_rdata,
+                            .additional => .additional_rdata,
+                            else => unreachable,
+                        };
+                    }
+
+                    logger.debug("resource from {}: {}", .{ old_state, raw_resource });
+
+                    return switch (old_state) {
+                        .answer => ParserFrame{ .answer = raw_resource },
+                        .nameserver => ParserFrame{ .nameserver = raw_resource },
+                        .additional => ParserFrame{ .additional = raw_resource },
+                        else => unreachable,
+                    };
+                }
+            },
+
+            .answer_rdata, .nameserver_rdata, .additional_rdata => {
+                const old_state = self.state;
+
+                self.state = switch (self.state) {
+                    .answer_rdata => .answer,
+                    .nameserver_rdata => .nameserver,
+                    .additional_rdata => .additional,
+                    else => unreachable,
+                };
+
+                const rdata_length = try reader.takeInt(u16, .big);
+                const rdata_index = reader.seek;
+                const rdata = ResourceDataHolder{
+                    .size = rdata_length,
+                    .current_byte_index = rdata_index,
+                };
+
+                return switch (old_state) {
+                    .answer_rdata => ParserFrame{ .answer_rdata = rdata },
+                    .nameserver_rdata => ParserFrame{ .nameserver_rdata = rdata },
+                    .additional_rdata => ParserFrame{ .additional_rdata = rdata },
+                    else => unreachable,
+                };
+            },
+
+            .done => return null,
         }
-    };
-}
+    }
+};
