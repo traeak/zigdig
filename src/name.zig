@@ -52,10 +52,10 @@ pub const Name = union(enum) {
 
     /// Caller owns returned memory.
     pub fn readFrom(
-        reader: *std.Io.Reader,
+        reader: *dns.parserlib.WrapperReader,
         options: dns.ParserOptions,
     ) !?Self {
-        const current_byte_index = reader.seek;
+        const current_byte_index = reader.currentByteOffset();
 
         if (options.allocator) |allocator| {
             var components = std.array_list.Managed(LabelComponent).init(allocator);
@@ -114,7 +114,7 @@ pub const Name = union(enum) {
     ///  - a full label ([]const u8)
     ///  - a null octet
     fn readLabelComponent(
-        reader: *std.Io.Reader,
+        wrapper: *dns.parserlib.WrapperReader,
         maybe_allocator: ?std.mem.Allocator,
     ) !?LabelComponent {
         // pointers, in the binary representation of a byte, are as follows
@@ -133,9 +133,10 @@ pub const Name = union(enum) {
         // length can only be a single byte.
         //
         // if the length is 0, its a null octet
+        const reader = wrapper.reader;
         logger.debug(
             "reading label component at {d} bytes",
-            .{reader.seek},
+            .{wrapper.currentByteOffset()},
         );
         const possible_length = try reader.takeInt(u8, .big);
         if (possible_length == 0) return LabelComponent{ .Null = {} };

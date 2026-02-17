@@ -192,13 +192,14 @@ pub const Question = struct {
 
     const Self = @This();
 
-    pub fn readFrom(reader: *std.Io.Reader, options: dns.ParserOptions) !Self {
+    pub fn readFrom(wrapper: *dns.parserlib.WrapperReader, options: dns.ParserOptions) !Self {
         logger.debug(
             "reading question at {d} bytes",
-            .{reader.seek},
+            .{wrapper.currentByteOffset()},
         );
 
-        const name = try Name.readFrom(reader, options);
+        const name = try Name.readFrom(wrapper, options);
+        const reader = wrapper.reader;
         const qtype = try reader.takeEnum(ResourceType, .big);
         const qclass = try ResourceClass.readFrom(reader);
 
@@ -233,12 +234,13 @@ pub const Resource = struct {
     ///
     /// Caller owns returned memory.
     fn readResourceDataFrom(
-        reader: *std.Io.Reader,
+        wrapper: *dns.parserlib.WrapperReader,
         options: dns.ParserOptions,
     ) !?dns.ResourceData.Opaque {
+        const reader = wrapper.reader;
         if (options.allocator) |allocator| {
             const rdata_length = try reader.takeInt(u16, .big);
-            const rdata_index = reader.seek;
+            const rdata_index = wrapper.currentByteOffset();
 
             const opaque_rdata = try allocator.alloc(u8, rdata_length);
             try reader.readSliceAll(opaque_rdata);
@@ -251,16 +253,17 @@ pub const Resource = struct {
         }
     }
 
-    pub fn readFrom(reader: *std.Io.Reader, options: dns.ParserOptions) !Self {
+    pub fn readFrom(wrapper: *dns.parserlib.WrapperReader, options: dns.ParserOptions) !Self {
         logger.debug(
             "reading resource at {d} bytes",
-            .{reader.seek},
+            .{wrapper.currentByteOffset()},
         );
-        const name = try Name.readFrom(reader, options);
+        const name = try Name.readFrom(wrapper, options);
+        const reader = wrapper.reader;
         const typ = try ResourceType.readFrom(reader);
         const class = try ResourceClass.readFrom(reader);
         const ttl = try reader.takeInt(i32, .big);
-        const opaque_rdata = try Self.readResourceDataFrom(reader, options);
+        const opaque_rdata = try Self.readResourceDataFrom(wrapper, options);
 
         return Self{
             .name = name,

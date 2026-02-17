@@ -106,58 +106,26 @@ pub const DeserializationContext = struct {
     current_byte_count: usize = 0,
 };
 
-/// Wrap an std.io.Reader with a DeserializationContext.
+/// Thin wrapper around a std.Io.Reader that tracks the global byte offset
+/// within a DNS packet.
 ///
-/// Automatically increments the DeserializationContext's `current_byte_count`
-/// on every read().
+/// For the main packet parser, base_offset is 0 and reader.seek gives the
+/// global position directly. For rdata parsing, base_offset is set to the
+/// rdata section's position in the overall packet.
 ///
-/// Useful to hold deserialization state without having to pass an entire
-/// parameter around on every single helper function.
-///
-/// This is necessary for DNS name resolution, as name offset can reference
-/// anywhere in the packet.
+/// This is necessary for DNS name pointer resolution, as pointers reference
+/// absolute byte offsets within the packet.
 pub const WrapperReader = struct {
-    underlying_reader: *std.Io.Reader,
-    ctx: *ParserContext,
-    interface: std.Io.Reader,
-    own_buffer: [4096]u8 = undefined,
+    reader: *std.Io.Reader,
+    base_offset: usize,
 
-    const Self = @This();
-
-    pub fn init(reader: *std.Io.Reader, ctx: *ParserContext) Self {
-        return .{
-            .underlying_reader = reader,
-            .ctx = ctx,
-            .interface = .{
-                .vtable = &.{
-                    .stream = WrapperReader.stream,
-                },
-                // buffer will be set by fixupBuffer after move
-                .buffer = undefined,
-                .seek = 0,
-                .end = 0,
-            },
-        };
+    pub fn init(reader: *std.Io.Reader, base_offset: usize) WrapperReader {
+        return .{ .reader = reader, .base_offset = base_offset };
     }
 
-    /// Must be called after init to fix up the internal buffer pointer.
-    /// This is needed because init returns by value, which invalidates
-    /// the self-referential pointer.
-    pub fn fixupBuffer(self: *Self) void {
-        // TODO maybe there's a better way for this? i'm not good at Zig interfaces
-        self.interface.buffer = &self.own_buffer;
-    }
-
-    fn stream(io_reader: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *Self = @alignCast(@fieldParentPtr("interface", io_reader));
-
-        const bytes_read = try self.underlying_reader.stream(w, limit);
-        self.ctx.current_byte_count += bytes_read;
-        logger.debug(
-            "wrapper reader: read {d} bytes, now at {d}",
-            .{ bytes_read, self.ctx.current_byte_count },
-        );
-        return bytes_read;
+    /// Current position in the overall packet.
+    pub fn currentByteOffset(self: *const WrapperReader) usize {
+        return self.base_offset + self.reader.seek;
     }
 };
 
@@ -171,24 +139,20 @@ pub const WrapperReader = struct {
 /// which only returns a list of `std.net.Address`, useful for domain lookups.
 pub const Parser = struct {
     state: ParserState = .header,
-    wrapper_reader: *std.Io.Reader,
+    wrapper_reader: WrapperReader,
     options: ParserOptions,
-    ctx: *ParserContext,
+    ctx: ParserContext = .{},
 
     const Self = @This();
 
     pub fn init(
         incoming_reader: *std.Io.Reader,
-        ctx: *ParserContext,
         options: ParserOptions,
     ) Self {
-        const self = Self{
-            .wrapper_reader = incoming_reader,
+        return Self{
+            .wrapper_reader = WrapperReader.init(incoming_reader, 0),
             .options = options,
-            .ctx = ctx,
         };
-
-        return self;
     }
 
     /// Receive the next frame from the parser.
@@ -197,12 +161,12 @@ pub const Parser = struct {
         // at the moment, first state always being header.
         logger.debug("next(): enter {}", .{self.state});
 
+        const reader = self.wrapper_reader.reader;
+
         logger.debug(
             "parser reader is at {d} bytes of message",
-            .{self.wrapper_reader.seek},
+            .{self.wrapper_reader.currentByteOffset()},
         );
-
-        var reader = self.wrapper_reader;
 
         switch (self.state) {
             .header => {
@@ -230,7 +194,7 @@ pub const Parser = struct {
                     logger.debug("parser: end question, go to resources", .{});
                     return ParserFrame{ .end_question = {} };
                 } else {
-                    const raw_question = try dns.Question.readFrom(reader, self.options);
+                    const raw_question = try dns.Question.readFrom(&self.wrapper_reader, self.options);
                     return ParserFrame{ .question = raw_question };
                 }
             },
@@ -276,7 +240,7 @@ pub const Parser = struct {
                         else => unreachable,
                     };
                 } else {
-                    const raw_resource = try dns.Resource.readFrom(reader, self.options);
+                    const raw_resource = try dns.Resource.readFrom(&self.wrapper_reader, self.options);
 
                     // not at end yet, which means resource_rdata event
                     // must happen if we don't have allocator
@@ -315,7 +279,7 @@ pub const Parser = struct {
                 };
 
                 const rdata_length = try reader.takeInt(u16, .big);
-                const rdata_index = reader.seek;
+                const rdata_index = self.wrapper_reader.currentByteOffset();
                 const rdata = ResourceDataHolder{
                     .size = rdata_length,
                     .current_byte_index = rdata_index,

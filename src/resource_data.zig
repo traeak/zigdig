@@ -30,15 +30,15 @@ pub const SRVData = struct {
 };
 
 fn maybeReadResourceName(
-    reader: *std.Io.Reader,
+    wrapper: *dns.parserlib.WrapperReader,
     options: ResourceData.ParseOptions,
 ) !?dns.Name {
     return switch (options.name_provider) {
         .none => null,
-        .raw => |allocator| try dns.Name.readFrom(reader, .{ .allocator = allocator }),
+        .raw => |allocator| try dns.Name.readFrom(wrapper, .{ .allocator = allocator }),
         .full => |name_pool| blk: {
             const name = try dns.Name.readFrom(
-                reader,
+                wrapper,
                 .{ .allocator = name_pool.allocator },
             );
             break :blk try name_pool.transmuteName(name.?);
@@ -223,16 +223,11 @@ pub const ResourceData = union(Type) {
 
         // important to keep track of that rdata's position in the packet
         // as rdata could point to other rdata.
-        var parser_ctx = dns.ParserContext{
-            .current_byte_count = opaque_resource_data.current_byte_count,
-        };
-
         var wrapper_reader = dns.parserlib.WrapperReader.init(
             &underlying_reader,
-            &parser_ctx,
+            opaque_resource_data.current_byte_count,
         );
-        wrapper_reader.fixupBuffer();
-        var reader = &wrapper_reader.interface;
+        var reader = wrapper_reader.reader;
 
         return switch (resource_type) {
             .A => blk: {
@@ -250,24 +245,24 @@ pub const ResourceData = union(Type) {
                 };
             },
 
-            .NS => ResourceData{ .NS = try maybeReadResourceName(reader, options) },
-            .CNAME => ResourceData{ .CNAME = try maybeReadResourceName(reader, options) },
-            .PTR => ResourceData{ .PTR = try maybeReadResourceName(reader, options) },
-            .MD => ResourceData{ .MD = try maybeReadResourceName(reader, options) },
-            .MF => ResourceData{ .MF = try maybeReadResourceName(reader, options) },
+            .NS => ResourceData{ .NS = try maybeReadResourceName(&wrapper_reader, options) },
+            .CNAME => ResourceData{ .CNAME = try maybeReadResourceName(&wrapper_reader, options) },
+            .PTR => ResourceData{ .PTR = try maybeReadResourceName(&wrapper_reader, options) },
+            .MD => ResourceData{ .MD = try maybeReadResourceName(&wrapper_reader, options) },
+            .MF => ResourceData{ .MF = try maybeReadResourceName(&wrapper_reader, options) },
 
             .MX => blk: {
                 break :blk ResourceData{
                     .MX = MXData{
                         .preference = try reader.takeInt(u16, .big),
-                        .exchange = try maybeReadResourceName(reader, options),
+                        .exchange = try maybeReadResourceName(&wrapper_reader, options),
                     },
                 };
             },
 
             .SOA => blk: {
-                const mname = try maybeReadResourceName(reader, options);
-                const rname = try maybeReadResourceName(reader, options);
+                const mname = try maybeReadResourceName(&wrapper_reader, options);
+                const rname = try maybeReadResourceName(&wrapper_reader, options);
                 const serial = try reader.takeInt(u32, .big);
                 const refresh = try reader.takeInt(u32, .big);
                 const retry = try reader.takeInt(u32, .big);
@@ -290,7 +285,7 @@ pub const ResourceData = union(Type) {
                 const priority = try reader.takeInt(u16, .big);
                 const weight = try reader.takeInt(u16, .big);
                 const port = try reader.takeInt(u16, .big);
-                const target = try maybeReadResourceName(reader, options);
+                const target = try maybeReadResourceName(&wrapper_reader, options);
                 break :blk ResourceData{
                     .SRV = .{
                         .priority = priority,

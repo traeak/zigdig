@@ -189,8 +189,7 @@ pub fn parseFullPacket(
         .packet = packet,
     };
 
-    var ctx = dns.ParserContext{};
-    var parser = dns.Parser.init(reader, &ctx, parser_options);
+    var parser = dns.Parser.init(reader, parser_options);
 
     var builtin_name_pool = dns.NamePool.init(allocator);
     defer builtin_name_pool.deinit();
@@ -380,9 +379,7 @@ pub fn receiveTrustedAddresses(
 
     var reader = std.Io.Reader.fixed(packet_bytes);
 
-    var ctx = dns.ParserContext{};
-
-    var parser = dns.Parser.init(&reader, &ctx, .{});
+    var parser = dns.Parser.init(&reader, .{});
 
     var addrs = std.array_list.Managed(std.net.Address).init(allocator);
     errdefer addrs.deinit();
