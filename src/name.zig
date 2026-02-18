@@ -151,13 +151,9 @@ pub const Name = union(enum) {
         if (bit1 and bit2) {
             const second_offset_component = try reader.takeInt(u8, .big);
 
-            // merge them together
-            var offset: u16 = (possible_length << 7) | second_offset_component;
-
-            // set first two bits of ptr_offset to zero as they're the
-            // pointer prefix bits (which are always 1, which brings problems)
-            offset &= ~@as(u16, 1 << 15);
-            offset &= ~@as(u16, 1 << 14);
+            // merge them together: strip the two pointer prefix bits from
+            // the first byte, then combine as a 14-bit offset
+            const offset: u16 = (@as(u16, possible_length & 0x3F) << 8) | @as(u16, second_offset_component);
 
             return LabelComponent{ .Pointer = offset };
         } else {
@@ -413,9 +409,10 @@ pub const NamePool = struct {
                             // full name.
 
                             const start_index = packet_index;
+                            // each label in wire format has a 1-byte length prefix
                             var name_length: usize = 0;
                             for (held_name.labels) |label|
-                                name_length += label.len;
+                                name_length += 1 + label.len;
                             const end_index = packet_index + name_length;
 
                             if (start_index <= packet_offset and packet_offset <= end_index) {
@@ -434,7 +431,8 @@ pub const NamePool = struct {
                                 if (label_start <= packet_offset) {
                                     label_index = idx;
                                 }
-                                label_cursor += label.len;
+                                // +1 for the length prefix byte in wire format
+                                label_cursor += 1 + label.len;
                             }
 
                             const referenced_labels = referenced_name.labels[label_index.?..];
