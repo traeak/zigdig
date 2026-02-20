@@ -148,18 +148,10 @@ pub const CidrRange = struct {
         return true;
     }
 
-    pub fn format(
-        self: Self,
-        comptime fmt_str: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt_str;
-        _ = options;
-
+    pub fn format(self: Self, writer: anytype) std.Io.Writer.Error!void {
         switch (self.version) {
             .v4 => {
-                try writer.print("{}.{}.{}.{}/{}", .{
+                try writer.print("{d}.{d}.{d}.{d}/{d}", .{
                     self.first_address[12],
                     self.first_address[13],
                     self.first_address[14],
@@ -169,7 +161,7 @@ pub const CidrRange = struct {
             },
             .v6 => {
                 const addr = std.net.Ip6Address.init(self.first_address, 0, 0, 0);
-                try writer.print("{}/{}", .{ addr, self.prefix_len });
+                try writer.print("{f}/{d}", .{ addr, self.prefix_len });
             },
         }
     }

@@ -3,19 +3,6 @@ const dns = @import("lib.zig");
 
 const logger = std.log.scoped(.dns_parser);
 
-/// Create a Parser object out of a reader, context, and options.
-///
-/// If you do not wish to have full control over deserialization, look at
-/// dns.helpers.parseFullPacket, which is a wrapper around the Parser that
-/// allocates everything.
-pub fn parser(
-    reader: anytype,
-    ctx: *ParserContext,
-    options: dns.ParserOptions,
-) Parser(@TypeOf(reader)) {
-    return Parser(@TypeOf(reader)).init(reader, ctx, options);
-}
-
 pub const ResourceResolutionOptions = struct {
     max_follow: usize = 32,
 };
@@ -57,14 +44,14 @@ pub const ResourceDataHolder = struct {
     size: usize,
     current_byte_index: usize,
 
-    pub fn skip(self: @This(), reader: anytype) !void {
-        try reader.skipBytes(self.size, .{});
+    pub fn skip(self: @This(), reader: *std.Io.Reader) void {
+        reader.toss(self.size);
     }
 
     pub fn readAllAlloc(
         self: @This(),
         allocator: std.mem.Allocator,
-        reader: anytype,
+        reader: *std.Io.Reader,
     ) !dns.ResourceData.Opaque {
         const opaque_rdata = try allocator.alloc(u8, self.size);
         const read_bytes = try reader.read(opaque_rdata);
@@ -119,210 +106,194 @@ pub const DeserializationContext = struct {
     current_byte_count: usize = 0,
 };
 
-/// Wrap a Reader with a type that contains a DeserializationContext.
+/// Thin wrapper around a std.Io.Reader that tracks the global byte offset
+/// within a DNS packet.
 ///
-/// Automatically increments the DeserializationContext's current_byte_count
-/// on every read().
+/// For the main packet parser, base_offset is 0 and reader.seek gives the
+/// global position directly. For rdata parsing, base_offset is set to the
+/// rdata section's position in the overall packet.
 ///
-/// Useful to hold deserialization state without having to pass an entire
-/// parameter around on every single helper function.
-pub fn WrapperReader(comptime ReaderType: anytype) type {
-    return struct {
-        underlying_reader: ReaderType,
-        ctx: *ParserContext,
+/// This is necessary for DNS name pointer resolution, as pointers reference
+/// absolute byte offsets within the packet.
+pub const WrapperReader = struct {
+    reader: *std.Io.Reader,
+    base_offset: usize,
 
-        const Self = @This();
+    pub fn init(reader: *std.Io.Reader, base_offset: usize) WrapperReader {
+        return .{ .reader = reader, .base_offset = base_offset };
+    }
 
-        pub fn read(self: *Self, buffer: []u8) !usize {
-            const bytes_read = try self.underlying_reader.read(buffer);
-            self.ctx.current_byte_count += bytes_read;
-            logger.debug(
-                "wrapper reader: read {d} bytes, now at {d}",
-                .{ bytes_read, self.ctx.current_byte_count },
-            );
-            return bytes_read;
-        }
+    /// Current position in the overall packet.
+    pub fn currentByteOffset(self: *const WrapperReader) usize {
+        return self.base_offset + self.reader.seek;
+    }
+};
 
-        pub const Error = ReaderType.Error;
-        pub const Reader = std.io.Reader(*Self, Error, read);
-        pub fn reader(self: *Self) Reader {
-            return Reader{ .context = self };
-        }
-    };
-}
-
-/// Low level parser for DNS packets.
+/// Low level parser for DNS packets. Create with `dns.Parser.init()`.
 ///
-/// There are two wrappers for this parser, dns.helpers.parseFullPacket,
-/// and dns.helpers.receiveTrustedAddresses.
-pub fn Parser(comptime ReaderType: type) type {
-    const WrapperR = WrapperReader(ReaderType);
+/// If you do not wish to have full control over deserialization, look at
+/// `dns.helpers.parseFullPacket`, which is a wrapper around the Parser that
+/// allocates all the necessary memory.
+///
+/// If you do not wish to allocate, there is `dns.helpers.receiveTrustedAddresses`
+/// which only returns a list of `std.net.Address`, useful for domain lookups.
+pub const Parser = struct {
+    state: ParserState = .header,
+    wrapper_reader: WrapperReader,
+    options: ParserOptions,
+    ctx: ParserContext = .{},
 
-    return struct {
-        state: ParserState = .header,
-        wrapper_reader: WrapperR,
+    const Self = @This();
+
+    pub fn init(
+        incoming_reader: *std.Io.Reader,
         options: ParserOptions,
-        ctx: *ParserContext,
+    ) Self {
+        return Self{
+            .wrapper_reader = WrapperReader.init(incoming_reader, 0),
+            .options = options,
+        };
+    }
 
-        const Self = @This();
+    /// Receive the next frame from the parser.
+    pub fn next(self: *Self) !?ParserFrame {
+        // self.state dictates what we *want* from the reader
+        // at the moment, first state always being header.
+        logger.debug("next(): enter {}", .{self.state});
 
-        pub fn init(
-            incoming_reader: ReaderType,
-            ctx: *ParserContext,
-            options: ParserOptions,
-        ) Self {
-            const self = Self{
-                .wrapper_reader = WrapperR{
-                    .underlying_reader = incoming_reader,
-                    .ctx = ctx,
-                },
-                .options = options,
-                .ctx = ctx,
-            };
+        const reader = self.wrapper_reader.reader;
 
-            return self;
-        }
+        logger.debug(
+            "parser reader is at {d} bytes of message",
+            .{self.wrapper_reader.currentByteOffset()},
+        );
 
-        /// Receive the next frame from the parser.
-        pub fn next(self: *Self) !?ParserFrame {
-            // self.state dictates what we *want* from the reader
-            // at the moment, first state always being header.
-            logger.debug("next(): enter {}", .{self.state});
+        switch (self.state) {
+            .header => {
+                // since header is constant size, store it
+                // in our parser state so we know how to continue
+                const header = try dns.Header.readFrom(reader);
+                self.ctx.header = header;
+                self.state = .question;
+                logger.debug(
+                    "next(): header read ({?}). state is now {}",
+                    .{ self.ctx.header, self.state },
+                );
+                return ParserFrame{ .header = header };
+            },
+            .question => {
+                logger.debug("next(): read {d} out of {d} questions", .{
+                    self.ctx.current_counts.question,
+                    self.ctx.header.?.question_length,
+                });
 
-            logger.debug(
-                "parser reader is at {d} bytes of message",
-                .{self.wrapper_reader.ctx.current_byte_count},
-            );
+                self.ctx.current_counts.question += 1;
 
-            var reader = self.wrapper_reader.reader();
+                if (self.ctx.current_counts.question > self.ctx.header.?.question_length) {
+                    self.state = .answer;
+                    logger.debug("parser: end question, go to resources", .{});
+                    return ParserFrame{ .end_question = {} };
+                } else {
+                    const raw_question = try dns.Question.readFrom(&self.wrapper_reader, self.options);
+                    return ParserFrame{ .question = raw_question };
+                }
+            },
+            .answer, .nameserver, .additional => {
+                const count_holder = (switch (self.state) {
+                    .answer => &self.ctx.current_counts.answer,
+                    .nameserver => &self.ctx.current_counts.nameserver,
+                    .additional => &self.ctx.current_counts.additional,
+                    else => unreachable,
+                });
 
-            switch (self.state) {
-                .header => {
-                    // since header is constant size, store it
-                    // in our parser state so we know how to continue
-                    const header = try dns.Header.readFrom(reader);
-                    self.ctx.header = header;
-                    self.state = .question;
-                    logger.debug(
-                        "next(): header read ({?}). state is now {}",
-                        .{ self.ctx.header, self.state },
-                    );
-                    return ParserFrame{ .header = header };
-                },
-                .question => {
-                    logger.debug("next(): read {d} out of {d} questions", .{
-                        self.ctx.current_counts.question,
-                        self.ctx.header.?.question_length,
-                    });
+                const header_count = switch (self.state) {
+                    .answer => self.ctx.header.?.answer_length,
+                    .nameserver => self.ctx.header.?.nameserver_length,
+                    .additional => self.ctx.header.?.additional_length,
+                    else => unreachable,
+                };
 
-                    self.ctx.current_counts.question += 1;
+                logger.debug("next(): read {d} out of {d} resources", .{
+                    count_holder.*, header_count,
+                });
 
-                    if (self.ctx.current_counts.question > self.ctx.header.?.question_length) {
-                        self.state = .answer;
-                        logger.debug("parser: end question, go to resources", .{});
-                        return ParserFrame{ .end_question = {} };
-                    } else {
-                        const raw_question = try dns.Question.readFrom(reader, self.options);
-                        return ParserFrame{ .question = raw_question };
-                    }
-                },
-                .answer, .nameserver, .additional => {
-                    const count_holder = (switch (self.state) {
-                        .answer => &self.ctx.current_counts.answer,
-                        .nameserver => &self.ctx.current_counts.nameserver,
-                        .additional => &self.ctx.current_counts.additional,
-                        else => unreachable,
-                    });
+                count_holder.* += 1;
 
-                    const header_count = switch (self.state) {
-                        .answer => self.ctx.header.?.answer_length,
-                        .nameserver => self.ctx.header.?.nameserver_length,
-                        .additional => self.ctx.header.?.additional_length,
-                        else => unreachable,
-                    };
-
-                    logger.debug("next(): read {d} out of {d} resources", .{
-                        count_holder.*, header_count,
-                    });
-
-                    count_holder.* += 1;
-
-                    if (count_holder.* > header_count) {
-                        const old_state = self.state;
-                        self.state = switch (self.state) {
-                            .answer => .nameserver,
-                            .nameserver => .additional,
-                            .additional => .done,
-                            else => unreachable,
-                        };
-
-                        logger.debug(
-                            "end resource list. state transition {} -> {}",
-                            .{ old_state, self.state },
-                        );
-
-                        return switch (old_state) {
-                            .answer => ParserFrame{ .end_answer = {} },
-                            .nameserver => ParserFrame{ .end_nameserver = {} },
-                            .additional => ParserFrame{ .end_additional = {} },
-                            else => unreachable,
-                        };
-                    } else {
-                        const raw_resource = try dns.Resource.readFrom(reader, self.options);
-
-                        // not at end yet, which means resource_rdata event
-                        // must happen if we don't have allocator
-
-                        const old_state = self.state;
-
-                        // if we don't have allocator, we emit rdata records
-                        if (self.options.allocator == null) {
-                            self.state = switch (self.state) {
-                                .answer => .answer_rdata,
-                                .nameserver => .nameserver_rdata,
-                                .additional => .additional_rdata,
-                                else => unreachable,
-                            };
-                        }
-
-                        logger.debug("resource from {}: {}", .{ old_state, raw_resource });
-
-                        return switch (old_state) {
-                            .answer => ParserFrame{ .answer = raw_resource },
-                            .nameserver => ParserFrame{ .nameserver = raw_resource },
-                            .additional => ParserFrame{ .additional = raw_resource },
-                            else => unreachable,
-                        };
-                    }
-                },
-
-                .answer_rdata, .nameserver_rdata, .additional_rdata => {
+                if (count_holder.* > header_count) {
                     const old_state = self.state;
-
                     self.state = switch (self.state) {
-                        .answer_rdata => .answer,
-                        .nameserver_rdata => .nameserver,
-                        .additional_rdata => .additional,
+                        .answer => .nameserver,
+                        .nameserver => .additional,
+                        .additional => .done,
                         else => unreachable,
                     };
 
-                    const rdata_length = try reader.readInt(u16, .big);
-                    const rdata_index = reader.context.ctx.current_byte_count;
-                    const rdata = ResourceDataHolder{
-                        .size = rdata_length,
-                        .current_byte_index = rdata_index,
-                    };
+                    logger.debug(
+                        "end resource list. state transition {} -> {}",
+                        .{ old_state, self.state },
+                    );
 
                     return switch (old_state) {
-                        .answer_rdata => ParserFrame{ .answer_rdata = rdata },
-                        .nameserver_rdata => ParserFrame{ .nameserver_rdata = rdata },
-                        .additional_rdata => ParserFrame{ .additional_rdata = rdata },
+                        .answer => ParserFrame{ .end_answer = {} },
+                        .nameserver => ParserFrame{ .end_nameserver = {} },
+                        .additional => ParserFrame{ .end_additional = {} },
                         else => unreachable,
                     };
-                },
+                } else {
+                    const raw_resource = try dns.Resource.readFrom(&self.wrapper_reader, self.options);
 
-                .done => return null,
-            }
+                    // not at end yet, which means resource_rdata event
+                    // must happen if we don't have allocator
+
+                    const old_state = self.state;
+
+                    // if we don't have allocator, we emit rdata records
+                    if (self.options.allocator == null) {
+                        self.state = switch (self.state) {
+                            .answer => .answer_rdata,
+                            .nameserver => .nameserver_rdata,
+                            .additional => .additional_rdata,
+                            else => unreachable,
+                        };
+                    }
+
+                    logger.debug("resource from {}: {}", .{ old_state, raw_resource });
+
+                    return switch (old_state) {
+                        .answer => ParserFrame{ .answer = raw_resource },
+                        .nameserver => ParserFrame{ .nameserver = raw_resource },
+                        .additional => ParserFrame{ .additional = raw_resource },
+                        else => unreachable,
+                    };
+                }
+            },
+
+            .answer_rdata, .nameserver_rdata, .additional_rdata => {
+                const old_state = self.state;
+
+                self.state = switch (self.state) {
+                    .answer_rdata => .answer,
+                    .nameserver_rdata => .nameserver,
+                    .additional_rdata => .additional,
+                    else => unreachable,
+                };
+
+                const rdata_length = try reader.takeInt(u16, .big);
+                const rdata_index = self.wrapper_reader.currentByteOffset();
+                const rdata = ResourceDataHolder{
+                    .size = rdata_length,
+                    .current_byte_index = rdata_index,
+                };
+
+                return switch (old_state) {
+                    .answer_rdata => ParserFrame{ .answer_rdata = rdata },
+                    .nameserver_rdata => ParserFrame{ .nameserver_rdata = rdata },
+                    .additional_rdata => ParserFrame{ .additional_rdata = rdata },
+                    else => unreachable,
+                };
+            },
+
+            .done => return null,
         }
-    };
-}
+    }
+};

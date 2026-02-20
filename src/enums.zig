@@ -70,8 +70,8 @@ pub const ResourceType = enum(u16) {
         return error.InvalidResourceType;
     }
 
-    pub fn readFrom(reader: anytype) !Self {
-        const resource_type_int = try reader.readInt(u16, .big);
+    pub fn readFrom(reader: *std.Io.Reader) !Self {
+        const resource_type_int = try reader.takeInt(u16, .big);
         return std.meta.intToEnum(Self, resource_type_int) catch |err| {
             logger.err(
                 "unknown resource type {d}, got {s}",
@@ -84,9 +84,8 @@ pub const ResourceType = enum(u16) {
     /// Write the network representation of this type to a stream.
     ///
     /// Returns amount of bytes written.
-    pub fn writeTo(self: Self, writer: anytype) !usize {
+    pub fn writeTo(self: Self, writer: anytype) !void {
         try writer.writeInt(u16, @intFromEnum(self), .big);
-        return 16 / 8;
     }
 };
 
@@ -100,8 +99,8 @@ pub const ResourceClass = enum(u16) {
     HS = 4,
     WILDCARD = 255,
 
-    pub fn readFrom(reader: anytype) !@This() {
-        const resource_class_int = try reader.readInt(u16, .big);
+    pub fn readFrom(reader: *std.Io.Reader) !@This() {
+        const resource_class_int = try reader.takeInt(u16, .big);
         return std.meta.intToEnum(@This(), resource_class_int) catch |err| {
             logger.err(
                 "unknown resource class {d}, got {s}",
@@ -114,8 +113,7 @@ pub const ResourceClass = enum(u16) {
     /// Write the network representation of this class to a stream.
     ///
     /// Returns amount of bytes written.
-    pub fn writeTo(self: @This(), writer: anytype) !usize {
+    pub fn writeTo(self: @This(), writer: anytype) !void {
         try writer.writeInt(u16, @intFromEnum(self), .big);
-        return 16 / 8;
     }
 };
