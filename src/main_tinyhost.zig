@@ -50,7 +50,7 @@ pub fn main() !void {
     var stdout = std.fs.File.stdout().writer(&stdout_buffer);
 
     for (addrs.addrs) |addr| {
-        try stdout.interface.print("{s} has address {any}\n", .{ name_string, addr });
+        try stdout.interface.print("{s} has address {f}\n", .{ name_string, addr });
     }
     try stdout.interface.flush();
 }
