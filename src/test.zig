@@ -30,7 +30,7 @@ const TEST_PKT_RESPONSE = "RM2BgAABAAEAAAAABmdvb2dsZQNjb20AAAEAAcAMAAEAAQAAASwAB
 const GOOGLE_COM_LABELS = [_][]const u8{ "google"[0..], "com"[0..] };
 
 test "Packet serialize/deserialize" {
-    const random_id = dns.helpers.randomHeaderId();
+    const random_id = dns.helpers.randomHeaderId(std.Io.Threaded.io(std.Io.Threaded.global_single_threaded));
     const packet = dns.Packet{
         .header = .{ .id = random_id },
         .questions = &[_]dns.Question{},
@@ -138,7 +138,7 @@ test "deserialization of reply google.com/A" {
         @as(dns.ResourceType, resource_data),
     );
 
-    const addr = @as(*const [4]u8, @ptrCast(&resource_data.A.in.sa.addr)).*;
+    const addr = resource_data.A.bytes;
     try testing.expectEqual(@as(u8, 216), addr[0]);
     try testing.expectEqual(@as(u8, 58), addr[1]);
     try testing.expectEqual(@as(u8, 202), addr[2]);
@@ -251,7 +251,7 @@ test "rdata serialization" {
     var name_buffer: [2][]const u8 = undefined;
     const name = try dns.Name.fromString("google.com", &name_buffer);
     var resource_data = dns.ResourceData{
-        .A = try std.net.Address.parseIp4("127.0.0.1", 0),
+        .A = try std.Io.net.Ip4Address.parse("127.0.0.1", 0),
     };
 
     var opaque_rdata_buffer: [1024]u8 = undefined;
@@ -293,8 +293,9 @@ test "rdata serialization" {
 test "localhost always resolves to 127.0.0.1" {
     const addrs = try helpers.getAddressList("localhost", 80, std.testing.allocator);
     defer addrs.deinit();
-    try std.testing.expectEqual(16777343, addrs.addrs[1].in.sa.addr);
-    try std.testing.expectEqualStrings("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", &addrs.addrs[0].in6.sa.addr);
+    // localhost resolution: first is IPv6 loopback, second is IPv4 loopback (127.0.0.1)
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, addrs.addrs[1].ip4.bytes);
+    try std.testing.expectEqual([16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, addrs.addrs[0].ip6.bytes);
 }
 
 test "NS records with cross-rdata pointer compression" {

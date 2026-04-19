@@ -48,7 +48,7 @@ fn maybeReadResourceName(
 
 /// Common representations of DNS' Resource Data.
 pub const ResourceData = union(Type) {
-    A: std.net.Address,
+    A: std.Io.net.Ip4Address,
 
     NS: ?dns.Name,
     MD: ?dns.Name,
@@ -82,7 +82,7 @@ pub const ResourceData = union(Type) {
     },
     MX: MXData,
     TXT: ?[]const u8,
-    AAAA: std.net.Address,
+    AAAA: std.Io.net.Ip6Address,
     SRV: SRVData,
     OPT: void, // EDNS0 is not implemented
 
@@ -112,7 +112,8 @@ pub const ResourceData = union(Type) {
     /// formatted to its representing IPv4 address.
     pub fn format(self: Self, writer: anytype) std.Io.Writer.Error!void {
         switch (self) {
-            .A, .AAAA => |addr| return writer.print("{f}", .{addr}),
+            .A => |addr| return writer.print("{d}.{d}.{d}.{d}:{d}", .{ addr.bytes[0], addr.bytes[1], addr.bytes[2], addr.bytes[3], addr.port }),
+            .AAAA => |addr| return writer.print("{f}", .{addr}),
 
             .NS, .MD, .MF, .MB, .MG, .MR, .CNAME, .PTR => |name| return writer.print("{?f}", .{name}),
 
@@ -142,10 +143,11 @@ pub const ResourceData = union(Type) {
     pub fn writeTo(self: Self, writer: *std.Io.Writer) !void {
         return switch (self) {
             .A => |addr| {
-                try writer.writeInt(u32, addr.in.sa.addr, .big);
-                // break :blk @sizeOf(@TypeOf(addr.in.sa.addr));
+                try writer.writeInt(u32, @as(u32, @bitCast(addr.bytes)), .big);
             },
-            .AAAA => |addr| _ = try writer.write(&addr.in6.sa.addr),
+            .AAAA => |addr| {
+                _ = try writer.write(&addr.bytes);
+            },
 
             .NS, .MD, .MF, .MB, .MG, .MR, .CNAME, .PTR => |name| try name.?.writeTo(writer),
 
@@ -234,14 +236,14 @@ pub const ResourceData = union(Type) {
                 var ip4addr: [4]u8 = undefined;
                 try reader.readSliceAll(&ip4addr);
                 break :blk ResourceData{
-                    .A = std.net.Address.initIp4(ip4addr, 0),
+                    .A = .{ .bytes = ip4addr, .port = 0 },
                 };
             },
             .AAAA => blk: {
                 var ip6_addr: [16]u8 = undefined;
                 try reader.readSliceAll(&ip6_addr);
                 break :blk ResourceData{
-                    .AAAA = std.net.Address.initIp6(ip6_addr, 0, 0, 0),
+                    .AAAA = .{ .bytes = ip6_addr, .port = 0, .flow = 0, .interface = .none },
                 };
             },
 

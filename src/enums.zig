@@ -72,13 +72,12 @@ pub const ResourceType = enum(u16) {
 
     pub fn readFrom(reader: *std.Io.Reader) !Self {
         const resource_type_int = try reader.takeInt(u16, .big);
-        return std.meta.intToEnum(Self, resource_type_int) catch |err| {
-            logger.err(
-                "unknown resource type {d}, got {s}",
-                .{ resource_type_int, @errorName(err) },
-            );
-            return err;
-        };
+        if (std.enums.fromInt(Self, resource_type_int)) |val| {
+            return val;
+        } else {
+            logger.err("unknown resource type {d}", .{resource_type_int});
+            return error.UnknownResourceType;
+        }
     }
 
     /// Write the network representation of this type to a stream.
@@ -101,13 +100,12 @@ pub const ResourceClass = enum(u16) {
 
     pub fn readFrom(reader: *std.Io.Reader) !@This() {
         const resource_class_int = try reader.takeInt(u16, .big);
-        return std.meta.intToEnum(@This(), resource_class_int) catch |err| {
-            logger.err(
-                "unknown resource class {d}, got {s}",
-                .{ resource_class_int, @errorName(err) },
-            );
-            return err;
-        };
+        if (std.enums.fromInt(@This(), resource_class_int)) |val| {
+            return val;
+        } else {
+            logger.err("unknown resource class {d}", .{resource_class_int});
+            return error.UnknownResourceClass;
+        }
     }
 
     /// Write the network representation of this class to a stream.

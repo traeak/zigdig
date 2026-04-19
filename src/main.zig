@@ -4,45 +4,11 @@ const dns = @import("lib.zig");
 
 const logger = std.log.scoped(.zigdig_main);
 
-pub const std_options = std.Options{
-    .log_level = .debug,
-    .logFn = logfn,
-};
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
 
-pub var current_log_level: std.log.Level = .info;
-
-fn logfn(
-    comptime message_level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    if (@intFromEnum(message_level) <= @intFromEnum(@import("root").current_log_level)) {
-        std.log.defaultLog(message_level, scope, format, args);
-    }
-}
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        _ = gpa.deinit();
-    }
-    const allocator = gpa.allocator();
-
-    if (builtin.os.tag == .windows) {
-        const debug = try std.unicode.utf8ToUtf16LeAllocZ(allocator, "DEBUG");
-        defer allocator.free(debug);
-
-        const debug_expected = try std.unicode.utf8ToUtf16LeAllocZ(allocator, "1");
-        defer allocator.free(debug_expected);
-
-        if (std.mem.eql(u16, std.process.getenvW(debug) orelse &[_]u16{0}, debug_expected)) current_log_level = .debug;
-    } else {
-        if (std.mem.eql(u8, std.posix.getenv("DEBUG") orelse "", "1")) current_log_level = .debug;
-    }
-
-    var args_it = try std.process.argsWithAllocator(allocator);
-    defer args_it.deinit();
+    var args_it = init.minimal.args.iterate();
     _ = args_it.skip();
 
     const name_string = (args_it.next() orelse {
@@ -78,7 +44,7 @@ pub fn main() !void {
     // create question packet
     var packet = dns.Packet{
         .header = .{
-            .id = dns.helpers.randomHeaderId(),
+            .id = dns.helpers.randomHeaderId(io),
             .is_response = false,
             .wanted_recursion = true,
             .question_length = 1,
@@ -91,26 +57,31 @@ pub fn main() !void {
 
     logger.debug("packet: {any}", .{packet});
 
-    const conn = if (builtin.os.tag == .windows) try dns.helpers.connectToResolver("8.8.8.8", null) else try dns.helpers.connectToSystemResolver();
+    const conn = if (builtin.os.tag == .windows)
+        try dns.helpers.connectToResolver("8.8.8.8", null)
+    else
+        try dns.helpers.connectToSystemResolver();
     defer conn.close();
 
-    logger.info("selected nameserver: {f}\n", .{conn.address});
+    logger.info("selected nameserver: {f}\n", .{conn.socket.address});
+
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout = std.Io.Writer.fixed(&stdout_buffer);
 
     // print out our same question as a zone file for debugging purposes
-    try dns.helpers.printAsZoneFile(&packet, undefined, &stdout.interface);
+    try dns.helpers.printAsZoneFile(&packet, undefined, &stdout);
 
-    try conn.sendPacket(packet);
+    try conn.sendPacket(io, conn.socket.address, packet);
 
     // as we need Names inside the NamePool to live beyond the call to
     // receiveFullPacket (since we need to deserialize names in RDATA)
     // we must take ownership of them and deinit ourselves
-    var name_pool = dns.NamePool.init(allocator);
+    var name_pool = dns.NamePool.init(gpa);
     defer name_pool.deinitWithNames();
 
     const reply = try conn.receiveFullPacket(
-        allocator,
+        io,
+        gpa,
         4096,
         .{ .name_pool = &name_pool },
     );
@@ -122,6 +93,6 @@ pub fn main() !void {
     try std.testing.expectEqual(packet.header.id, reply_packet.header.id);
     try std.testing.expect(reply_packet.header.is_response);
 
-    try dns.helpers.printAsZoneFile(reply_packet, &name_pool, &stdout.interface);
-    try stdout.interface.flush();
+    try dns.helpers.printAsZoneFile(reply_packet, &name_pool, &stdout);
+    try stdout.flush();
 }
