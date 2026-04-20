@@ -13,7 +13,7 @@ pub var current_log_level: std.log.Level = .info;
 
 fn logfn(
     comptime message_level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: @TypeOf(.enum_literal),
     comptime format: []const u8,
     args: anytype,
 ) void {
@@ -22,28 +22,14 @@ fn logfn(
     }
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        _ = gpa.deinit();
-    }
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    if (builtin.os.tag == .windows) {
-        const debug = try std.unicode.utf8ToUtf16LeAllocZ(allocator, "DEBUG");
-        defer allocator.free(debug);
+    if (std.mem.eql(u8, init.environ_map.get("DEBUG") orelse "", "1")) current_log_level = .debug;
 
-        const debug_expected = try std.unicode.utf8ToUtf16LeAllocZ(allocator, "1");
-        defer allocator.free(debug_expected);
-
-        if (std.mem.eql(u16, std.process.getenvW(debug) orelse &[_]u16{0}, debug_expected)) current_log_level = .debug;
-    } else {
-        if (std.mem.eql(u8, std.posix.getenv("DEBUG") orelse "", "1")) current_log_level = .debug;
-    }
-
-    var args_it = try std.process.argsWithAllocator(allocator);
-    defer args_it.deinit();
-    _ = args_it.skip();
+    var args_it = init.minimal.args.iterate();
+    _ = args_it.next(); // skip program name
 
     const name_string = (args_it.next() orelse {
         logger.warn("no name provided", .{});
@@ -78,7 +64,7 @@ pub fn main() !void {
     // create question packet
     var packet = dns.Packet{
         .header = .{
-            .id = dns.helpers.randomHeaderId(),
+            .id = dns.helpers.randomHeaderId(io),
             .is_response = false,
             .wanted_recursion = true,
             .question_length = 1,
@@ -91,12 +77,12 @@ pub fn main() !void {
 
     logger.debug("packet: {any}", .{packet});
 
-    const conn = if (builtin.os.tag == .windows) try dns.helpers.connectToResolver("8.8.8.8", null) else try dns.helpers.connectToSystemResolver();
+    const conn = if (builtin.os.tag == .windows) try dns.helpers.connectToResolver(io, "8.8.8.8", null) else try dns.helpers.connectToSystemResolver(io);
     defer conn.close();
 
     logger.info("selected nameserver: {f}\n", .{conn.address});
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
 
     // print out our same question as a zone file for debugging purposes
     try dns.helpers.printAsZoneFile(&packet, undefined, &stdout.interface);

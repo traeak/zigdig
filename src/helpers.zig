@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const ws2_32 = std.os.windows.ws2_32;
 const dns = @import("lib.zig");
 
 const CidrRange = @import("cidr.zig").CidrRange;
@@ -102,8 +101,10 @@ pub fn printAsZoneFile(
 }
 
 /// Generate a random header ID to use in a query.
-pub fn randomHeaderId() u16 {
-    const seed = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+pub fn randomHeaderId(io: std.Io) u16 {
+    var seed_buf: [8]u8 = undefined;
+    io.random(&seed_buf);
+    const seed = std.mem.readInt(u64, &seed_buf, .little);
     var r = std.Random.DefaultPrng.init(seed);
     return r.random().int(u16);
 }
@@ -111,45 +112,27 @@ pub fn randomHeaderId() u16 {
 /// High level wrapper around a single UDP connection to send and receive
 /// DNS packets.
 pub const DNSConnection = struct {
-    address: std.net.Address,
-    socket: std.net.Stream,
+    address: std.Io.net.IpAddress,
+    socket: std.Io.net.Socket,
+    io: std.Io,
 
     const Self = @This();
 
     pub fn close(self: Self) void {
-        self.socket.close();
+        self.socket.close(self.io);
     }
 
     pub fn sendPacket(self: Self, packet: dns.Packet) !void {
-        // Stream won't use sendto() when its UDP, so serialize it into
-        // a buffer, and then send that
         var buffer: [1024]u8 = undefined;
 
-        var writer = std.io.Writer.fixed(&buffer);
+        var writer = std.Io.Writer.fixed(&buffer);
         try packet.writeTo(&writer);
 
         const result = buffer[0..writer.end];
-        const dest_len: u32 = switch (self.address.any.family) {
-            std.posix.AF.INET => @sizeOf(std.posix.sockaddr.in),
-            std.posix.AF.INET6 => @sizeOf(std.posix.sockaddr.in6),
-            else => unreachable,
-        };
-
-        _ = try std.posix.sendto(
-            self.socket.handle,
-            result,
-            0,
-            &self.address.any,
-            dest_len,
-        );
+        try self.socket.send(self.io, &self.address, result);
     }
 
     /// Deserializes and allocates an *entire* DNS packet.
-    ///
-    /// This function is not encouraged if you only wish to get A/AAAA
-    /// records for a domain name through the system DNS resolver, as this
-    /// allocates all the data of the packet. Use `receiveTrustedAddresses`
-    /// for such.
     pub fn receiveFullPacket(
         self: Self,
         packet_allocator: std.mem.Allocator,
@@ -158,8 +141,9 @@ pub const DNSConnection = struct {
         options: ParseFullPacketOptions,
     ) !dns.IncomingPacket {
         var packet_buffer: [max_incoming_message_size]u8 = undefined;
-        const read_bytes = try self.socket.read(&packet_buffer);
-        const packet_bytes = packet_buffer[0..read_bytes];
+        const msg = try self.socket.receive(self.io, &packet_buffer);
+        const read_bytes = msg.data.len;
+        const packet_bytes = msg.data;
         logger.debug("read {d} bytes", .{read_bytes});
 
         var stream = std.Io.Reader.fixed(packet_bytes);
@@ -170,8 +154,6 @@ pub const DNSConnection = struct {
 pub const ParseFullPacketOptions = struct {
     /// Use this NamePool to let deserialization of names outlive the call
     /// to parseFullPacket.
-    ///
-    /// Useful if you need to parse RDATA sections after parseFullPacket.
     name_pool: ?*dns.NamePool = null,
 };
 
@@ -194,22 +176,22 @@ pub fn parseFullPacket(
     var builtin_name_pool = dns.NamePool.init(allocator);
     defer builtin_name_pool.deinit();
 
-    var name_pool = if (parse_full_packet_options.name_pool) |name_pool|
-        name_pool
+    var name_pool = if (parse_full_packet_options.name_pool) |np|
+        np
     else
         &builtin_name_pool;
 
-    var questions = std.array_list.Managed(dns.Question).init(allocator);
-    defer questions.deinit();
+    var questions = std.ArrayList(dns.Question).empty;
+    defer questions.deinit(allocator);
 
-    var answers = std.array_list.Managed(dns.Resource).init(allocator);
-    defer answers.deinit();
+    var answers = std.ArrayList(dns.Resource).empty;
+    defer answers.deinit(allocator);
 
-    var nameservers = std.array_list.Managed(dns.Resource).init(allocator);
-    defer nameservers.deinit();
+    var nameservers = std.ArrayList(dns.Resource).empty;
+    defer nameservers.deinit(allocator);
 
-    var additionals = std.array_list.Managed(dns.Resource).init(allocator);
-    defer additionals.deinit();
+    var additionals = std.ArrayList(dns.Resource).empty;
+    defer additionals.deinit(allocator);
 
     while (try parser.next()) |part| {
         switch (part) {
@@ -217,22 +199,21 @@ pub fn parseFullPacket(
             .question => |question_with_raw_names| {
                 const question =
                     try name_pool.transmuteResource(question_with_raw_names);
-                try questions.append(question);
+                try questions.append(allocator, question);
             },
-            .end_question => packet.questions = try questions.toOwnedSlice(),
+            .end_question => packet.questions = try questions.toOwnedSlice(allocator),
             .answer, .nameserver, .additional => |raw_resource| {
-                // since we give it an allocator, we don't receive rdata frames
                 const resource = try name_pool.transmuteResource(raw_resource);
                 try (switch (part) {
-                    .answer => answers,
-                    .nameserver => nameservers,
-                    .additional => additionals,
+                    .answer => &answers,
+                    .nameserver => &nameservers,
+                    .additional => &additionals,
                     else => unreachable,
-                }).append(resource);
+                }).append(allocator, resource);
             },
-            .end_answer => packet.answers = try answers.toOwnedSlice(),
-            .end_nameserver => packet.nameservers = try nameservers.toOwnedSlice(),
-            .end_additional => packet.additionals = try additionals.toOwnedSlice(),
+            .end_answer => packet.answers = try answers.toOwnedSlice(allocator),
+            .end_nameserver => packet.nameservers = try nameservers.toOwnedSlice(allocator),
+            .end_additional => packet.additionals = try additionals.toOwnedSlice(allocator),
             .answer_rdata, .nameserver_rdata, .additional_rdata => unreachable,
         }
     }
@@ -243,59 +224,43 @@ pub fn parseFullPacket(
 const logger = std.log.scoped(.dns_helpers);
 
 /// Open a socket to the DNS resolver specified in input parameter
-pub fn connectToResolver(address: []const u8, port: ?u16) !DNSConnection {
-    const addr = blk: {
-        if (builtin.os.tag == .windows) {
-            // it is recommended to use `resolveIp`, but windows currently does
-            // not support resolving ipv6 addresses. there is a PR for the
-            // stdlib here: https://github.com/ziglang/zig/pull/22555 as soon
-            // as that is merged, this can be removed. till then, as
-            // `resolveIp` is only recommended in order to handle ipv6 link
-            // local addresses, we can use `parseIp`, as the use case
-            // `resolveIp` is intended for doesnt work.
-            break :blk try std.net.Address.parseIp(address, port orelse 53);
-        } else {
-            break :blk try std.net.Address.resolveIp(address, port orelse 53);
-        }
+pub fn connectToResolver(io: std.Io, address: []const u8, port: ?u16) !DNSConnection {
+    const addr = try std.Io.net.IpAddress.parse(address, port orelse 53);
+
+    // Bind to any local address to create a UDP socket
+    const local_addr: std.Io.net.IpAddress = switch (addr) {
+        .ip4 => .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+        .ip6 => .{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .port = 0 } },
     };
 
-    const flags: u32 = std.posix.SOCK.DGRAM;
-    const fd = try std.posix.socket(addr.any.family, flags, std.posix.IPPROTO.UDP);
+    const socket = try std.Io.net.IpAddress.bind(&local_addr, io, .{ .mode = .dgram });
 
     return DNSConnection{
         .address = addr,
-        .socket = std.net.Stream{ .handle = fd },
+        .socket = socket,
+        .io = io,
     };
 }
 
 /// Open a socket to a random DNS resolver declared in the systems'
 /// "/etc/resolv.conf" file.
-pub fn connectToSystemResolver() !DNSConnection {
-    //@compileLog("should not be reached");
+pub fn connectToSystemResolver(io: std.Io) !DNSConnection {
     var out_buffer: [256]u8 = undefined;
 
-    if (builtin.os.tag != .linux) @compileError("connectToSystemResolver not supported on this target");
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos)
+        @compileError("connectToSystemResolver not supported on this target");
 
-    const nameserver_address_string = (try randomNameserver(&out_buffer)).?;
+    const nameserver_address_string = (try randomNameserver(io, &out_buffer)).?;
 
-    return connectToResolver(nameserver_address_string, null);
+    return connectToResolver(io, nameserver_address_string, null);
 }
 
-pub fn randomNameserver(output_buffer: []u8) !?[]const u8 {
-    var file = try std.fs.cwd().openFile(
-        "/etc/resolv.conf",
-        .{ .mode = .read_only },
-    );
-    defer file.close();
-
-    // iterate through all lines to find the amount of nameservers, then select
-    // a random one, then read AGAIN so that we can return it.
-    //
-    // this doesn't need any allocator or lists or whatever. just the
-    // output buffer
+pub fn randomNameserver(io: std.Io, output_buffer: []u8) !?[]const u8 {
+    var file = try std.Io.Dir.cwd().openFile(io, "/etc/resolv.conf", .{ .mode = .read_only });
+    defer file.close(io);
 
     var line_buffer: [1024]u8 = undefined;
-    var reader = file.reader(&line_buffer);
+    var reader = file.reader(io, &line_buffer);
     try reader.seekTo(0);
 
     var nameserver_amount: usize = 0;
@@ -311,7 +276,9 @@ pub fn randomNameserver(output_buffer: []u8) !?[]const u8 {
         }
     }
 
-    const seed = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
+    var seed_buf: [8]u8 = undefined;
+    io.random(&seed_buf);
+    const seed = std.mem.readInt(u64, &seed_buf, .little);
     var r = std.Random.DefaultPrng.init(seed);
     const selected = r.random().uintLessThan(usize, nameserver_amount);
 
@@ -343,13 +310,13 @@ pub fn randomNameserver(output_buffer: []u8) !?[]const u8 {
 
 const AddressList = struct {
     allocator: std.mem.Allocator,
-    addrs: []std.net.Address,
+    addrs: []std.Io.net.IpAddress,
     pub fn deinit(self: @This()) void {
         self.allocator.free(self.addrs);
     }
 
-    fn fromList(allocator: std.mem.Allocator, addrs: *std.array_list.Managed(std.net.Address)) !AddressList {
-        return AddressList{ .allocator = allocator, .addrs = try addrs.toOwnedSlice() };
+    fn fromList(allocator: std.mem.Allocator, addrs: *std.ArrayList(std.Io.net.IpAddress)) !AddressList {
+        return AddressList{ .allocator = allocator, .addrs = try addrs.toOwnedSlice(allocator) };
     }
 };
 
@@ -359,30 +326,25 @@ const ReceiveTrustedAddressesOptions = struct {
 };
 
 /// This is an optimized deserializer that is only interested in A and AAAA
-/// answers, returning a list of std.net.Address.
-///
-/// This function trusts the DNS connection to be returning answers related
-/// to the given domain sent through DNSConnection.sendPacket.
-///
-/// This, however, does not allocate the packet. It is very memory efficient
-/// in that regard.
+/// answers, returning a list of std.Io.net.IpAddress.
 pub fn receiveTrustedAddresses(
     allocator: std.mem.Allocator,
     connection: *const DNSConnection,
     /// Options to receive message and deserialize it
     comptime options: ReceiveTrustedAddressesOptions,
-) ![]std.net.Address {
+) ![]std.Io.net.IpAddress {
     var packet_buffer: [options.max_incoming_message_size]u8 = undefined;
-    const read_bytes = try connection.socket.read(&packet_buffer);
-    const packet_bytes = packet_buffer[0..read_bytes];
+    const msg = try connection.socket.receive(connection.io, &packet_buffer);
+    const read_bytes = msg.data.len;
+    const packet_bytes = msg.data;
     logger.debug("read {d} bytes", .{read_bytes});
 
     var reader = std.Io.Reader.fixed(packet_bytes);
 
     var parser = dns.Parser.init(&reader, .{});
 
-    var addrs = std.array_list.Managed(std.net.Address).init(allocator);
-    errdefer addrs.deinit();
+    var addrs = std.ArrayList(std.Io.net.IpAddress).empty;
+    errdefer addrs.deinit(allocator);
 
     var current_resource: ?dns.Resource = null;
 
@@ -398,7 +360,7 @@ pub fn receiveTrustedAddresses(
 
                 switch (header.response_code) {
                     .NoError => {},
-                    .FormatError => return error.ServerFormatError, // bug in implementation caught by server?
+                    .FormatError => return error.ServerFormatError,
                     .ServerFailure => return error.ServerFailure,
                     .NameError => return error.ServerNameError,
                     .NotImplemented => return error.ServerNotImplemented,
@@ -411,16 +373,16 @@ pub fn receiveTrustedAddresses(
 
             .answer_rdata => |rdata| {
                 defer current_resource = null;
-                const maybe_addr = switch (current_resource.?.typ) {
+                const maybe_addr: ?std.Io.net.IpAddress = switch (current_resource.?.typ) {
                     .A => blk: {
                         var ip4addr: [4]u8 = undefined;
                         _ = try reader.readSliceAll(&ip4addr);
-                        break :blk std.net.Address.initIp4(ip4addr, 0);
+                        break :blk .{ .ip4 = .{ .bytes = ip4addr, .port = 0 } };
                     },
                     .AAAA => blk: {
                         var ip6_addr: [16]u8 = undefined;
                         _ = try reader.readSliceAll(&ip6_addr);
-                        break :blk std.net.Address.initIp6(ip6_addr, 0, 0, 0);
+                        break :blk .{ .ip6 = .{ .bytes = ip6_addr, .port = 0 } };
                     },
                     else => blk: {
                         reader.toss(rdata.size);
@@ -428,20 +390,21 @@ pub fn receiveTrustedAddresses(
                     },
                 };
 
-                if (maybe_addr) |addr| try addrs.append(addr);
+                if (maybe_addr) |addr| try addrs.append(allocator, addr);
             },
             else => {},
         }
     }
 
-    return try addrs.toOwnedSlice();
+    return try addrs.toOwnedSlice(allocator);
 }
 
 fn fetchTrustedAddresses(
     allocator: std.mem.Allocator,
+    io: std.Io,
     name: dns.Name,
     qtype: dns.ResourceType,
-) ![]std.net.Address {
+) ![]std.Io.net.IpAddress {
     var questions = [_]dns.Question{
         .{
             .name = name,
@@ -452,7 +415,7 @@ fn fetchTrustedAddresses(
 
     const packet = dns.Packet{
         .header = .{
-            .id = dns.helpers.randomHeaderId(),
+            .id = dns.helpers.randomHeaderId(io),
             .is_response = false,
             .wanted_recursion = true,
             .question_length = 1,
@@ -463,8 +426,7 @@ fn fetchTrustedAddresses(
         .additionals = &[_]dns.Resource{},
     };
 
-    //@compileLog("from fetchtrustedaddresses");
-    const conn = try dns.helpers.connectToSystemResolver();
+    const conn = try dns.helpers.connectToSystemResolver(io);
     defer conn.close();
 
     logger.debug("selected nameserver: {f}", .{conn.address});
@@ -473,21 +435,20 @@ fn fetchTrustedAddresses(
 }
 
 // implementation taken from std.net address resolution
-fn lookupHosts(addrs: *std.array_list.Managed(std.net.Address), family: std.posix.sa_family_t, port: u16, name: []const u8) !void {
-    const file = std.fs.openFileAbsoluteZ("/etc/hosts", .{}) catch |err| switch (err) {
+fn lookupHosts(allocator: std.mem.Allocator, io: std.Io, addrs: *std.ArrayList(std.Io.net.IpAddress), port: u16, name: []const u8) !void {
+    const file = std.Io.Dir.openFileAbsolute(io, "/etc/hosts", .{}) catch |err| switch (err) {
         error.FileNotFound,
         error.NotDir,
         error.AccessDenied,
         => return,
         else => |e| return e,
     };
-    defer file.close();
+    defer file.close(io);
 
     var buffer: [4096]u8 = undefined;
-    var reader = file.reader(&buffer);
+    var reader = file.reader(io, &buffer);
     while (reader.interface.takeDelimiter('\n') catch |err| switch (err) {
         error.StreamTooLong => {
-            // line too long
             return error.StreamTooLong;
         },
         else => |e| return e,
@@ -505,131 +466,46 @@ fn lookupHosts(addrs: *std.array_list.Managed(std.net.Address), family: std.posi
             }
         } else continue;
 
-        const addr = std.net.Address.parseExpectingFamily(ip_text, family, port) catch |err| switch (err) {
-            error.Overflow,
-            error.InvalidEnd,
-            error.InvalidCharacter,
-            error.Incomplete,
-            error.InvalidIPAddressFormat,
-            error.InvalidIpv4Mapping,
-            error.NonCanonical,
-            => continue,
-        };
-        try addrs.append(addr);
+        const addr = std.Io.net.IpAddress.parse(ip_text, port) catch continue;
+        try addrs.append(allocator, addr);
     }
 }
 
 /// A getAddressList-like function that:
 ///  - gets a nameserver from resolv.conf
 ///  - starts a DNSConnection
-///  - extracts A/AAAA records and turns them into std.net.Address
+///  - extracts A/AAAA records and turns them into std.Io.net.IpAddress
 ///
-/// The only memory allocated here is for the list that holds std.net.Address.
-///
-/// This function does not implement the "happy eyeballs" algorithm.
-pub fn getAddressList(incoming_name: []const u8, port: u16, allocator: std.mem.Allocator) !AddressList {
+/// The only memory allocated here is for the list that holds IpAddress.
+pub fn getAddressList(io: std.Io, incoming_name: []const u8, port: u16, allocator: std.mem.Allocator) !AddressList {
     var name_buffer: [128][]const u8 = undefined;
     const name = try dns.Name.fromString(incoming_name, &name_buffer);
 
-    var final_list = std.array_list.Managed(std.net.Address).init(allocator);
-    defer final_list.deinit();
+    var final_list = std.ArrayList(std.Io.net.IpAddress).empty;
+    defer final_list.deinit(allocator);
 
     const last_label = name.full.labels[name.full.labels.len - 1];
 
     // see if we can short-circuit on parsing the name as addr
-    if (std.net.Address.parseExpectingFamily(incoming_name, std.posix.AF.INET, port) catch null) |addr| {
-        try final_list.append(addr);
-    } else if (std.net.Address.parseExpectingFamily(incoming_name, std.posix.AF.INET6, port) catch null) |addr| {
-        try final_list.append(addr);
+    if (std.Io.net.IpAddress.parse(incoming_name, port) catch null) |addr| {
+        try final_list.append(allocator, addr);
     } else if (std.mem.eql(u8, last_label, "localhost")) {
         // RFC 6761 Section 6.3.3
-        // Name resolution APIs and libraries SHOULD recognize localhost
-        // names as special and SHOULD always return the IP loopback address
-        // for address queries and negative responses for all other query
-        // types.
-        try final_list.append(std.net.Address.parseIp4("127.0.0.1", port) catch unreachable);
-        try final_list.append(std.net.Address.parseIp6("::1", port) catch unreachable);
+        try final_list.append(allocator, .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } });
+        try final_list.append(allocator, .{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = port } });
     } else {
-        if (builtin.os.tag == .windows) {
-            const name_c = try allocator.dupeZ(u8, incoming_name);
-            defer allocator.free(name_c);
-
-            const port_c = try std.fmt.allocPrintZ(allocator, "{}", .{port});
-            defer allocator.free(port_c);
-
-            var addr_info: ?*ws2_32.addrinfoa = null;
-
-            const hints: ws2_32.addrinfo = .{
-                .flags = .{ .NUMERICSERV = true },
-                .family = ws2_32.AF.UNSPEC,
-                .socktype = ws2_32.SOCK.STREAM,
-                .protocol = ws2_32.IPPROTO.TCP,
-                .addr = null,
-                .canonname = null,
-                .addrlen = 0,
-                .next = null,
-            };
-
-            for (0..2) |_| {
-                const res = ws2_32.getaddrinfo(name_c.ptr, port_c.ptr, &hints, &addr_info);
-
-                if (res != 0) {
-                    switch (@as(ws2_32.WinsockError, @enumFromInt(res))) {
-                        .WSATRY_AGAIN => return error.TryAgain,
-                        .WSAEINVAL => return error.InvalidArgument,
-                        .WSANO_RECOVERY => return error.Fatal,
-                        .WSAEAFNOSUPPORT => return error.FamilyNotSupported,
-                        .WSA_NOT_ENOUGH_MEMORY => return error.NotEnoughMemory,
-                        .WSAHOST_NOT_FOUND => return error.HostNotFound,
-                        .WSATYPE_NOT_FOUND => return error.TypeNotFound,
-                        .WSAESOCKTNOSUPPORT => return error.SocketTypeNotSupported,
-                        .WSANOTINITIALISED => {
-                            try std.os.windows.callWSAStartup();
-                            continue;
-                        },
-                        else => return error.InternalUnexpected,
-                    }
-                } else break;
-            } else return error.InternalUnexpected;
-
-            defer ws2_32.freeaddrinfo(addr_info);
-
-            while (addr_info) |ai| : (addr_info = ai.next) {
-                switch (ai.family) {
-                    ws2_32.AF.INET => {
-                        const sa: *ws2_32.sockaddr.in = @as(
-                            *ws2_32.sockaddr.in,
-                            @ptrCast(@alignCast(ai.addr orelse continue)),
-                        );
-                        const addr = std.net.Address.initIp4(@as([4]u8, @bitCast(sa.addr)), sa.port);
-
-                        try final_list.append(addr);
-                    },
-                    ws2_32.AF.INET6 => {
-                        const sa: *ws2_32.sockaddr.in6 = @as(
-                            *ws2_32.sockaddr.in6,
-                            @ptrCast(@alignCast(ai.addr orelse continue)),
-                        );
-                        const addr = std.net.Address.initIp6(sa.addr, sa.port, 0, 0);
-
-                        try final_list.append(addr);
-                    },
-                    else => continue,
-                }
-            }
-        } else if (builtin.os.tag == .linux) {
-            try lookupHosts(&final_list, std.posix.AF.INET, port, incoming_name);
-            try lookupHosts(&final_list, std.posix.AF.INET, port, incoming_name);
+        if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+            try lookupHosts(allocator, io, &final_list, port, incoming_name);
 
             if (final_list.items.len == 0) {
                 // if that didn't work, go to dns server
-                const addrs_v4 = try fetchTrustedAddresses(allocator, name, .A);
+                const addrs_v4 = try fetchTrustedAddresses(allocator, io, name, .A);
                 defer allocator.free(addrs_v4);
-                for (addrs_v4) |addr| try final_list.append(addr);
+                for (addrs_v4) |addr| try final_list.append(allocator, addr);
 
-                const addrs_v6 = try fetchTrustedAddresses(allocator, name, .AAAA);
+                const addrs_v6 = try fetchTrustedAddresses(allocator, io, name, .AAAA);
                 defer allocator.free(addrs_v6);
-                for (addrs_v6) |addr| try final_list.append(addr);
+                for (addrs_v6) |addr| try final_list.append(allocator, addr);
             }
         } else @compileError("getAddressList not supported on this target");
     }
@@ -637,11 +513,11 @@ pub fn getAddressList(incoming_name: []const u8, port: u16, allocator: std.mem.A
     // RFC 6761 is not run if everything is v4 or only 1 address returned
     if (final_list.items.len == 1) return AddressList.fromList(allocator, &final_list);
     const all_ip4 = for (final_list.items) |addr| {
-        if (addr.any.family != std.posix.AF.INET) break false;
+        if (addr != .ip4) break false;
     } else true;
     if (all_ip4) return AddressList.fromList(allocator, &final_list);
 
-    std.mem.sort(std.net.Address, final_list.items, {}, addrCmpLessThan);
+    std.mem.sort(std.Io.net.IpAddress, final_list.items, {}, addrCmpLessThan);
 
     return AddressList.fromList(allocator, &final_list);
 }
@@ -660,13 +536,14 @@ const Policy = struct {
 const policy_table = [_]Policy{
     Policy.new(CidrRange.parse("::1/128") catch unreachable, 50, 0), // Loopback
     Policy.new(CidrRange.parse("::/0") catch unreachable, 40, 1), // Default
-    Policy.new(CidrRange.parse("::ffff:0:0/96") catch unreachable, 35, 4), // IPv4-mapped
+    Policy.new(CidrRange.parse("0:0:0:0:0:ffff:0:0/96") catch unreachable, 35, 4), // IPv4-mapped
     Policy.new(CidrRange.parse("2002::/16") catch unreachable, 30, 2), // 6to4
     Policy.new(CidrRange.parse("2001::/32") catch unreachable, 5, 5), // Teredo
     Policy.new(CidrRange.parse("fc00::/7") catch unreachable, 3, 13), // ULA
     Policy.new(CidrRange.parse("::/96") catch unreachable, 1, 3), // IPv4-compatible
 };
-fn cmpGetPrecedence(addr: std.net.Address) usize {
+
+fn cmpGetPrecedence(addr: std.Io.net.IpAddress) usize {
     for (policy_table) |policy| {
         if (policy.cidr.contains(addr) catch unreachable) {
             return policy.precedence;
@@ -675,28 +552,47 @@ fn cmpGetPrecedence(addr: std.net.Address) usize {
     return 40; // Default precedence if no match
 }
 
-fn isMulticast(a: std.net.Address) bool {
-    return a.in6.sa.addr[0] == 0xff;
+fn getIp6Bytes(addr: std.Io.net.IpAddress) [16]u8 {
+    return switch (addr) {
+        .ip4 => |ip4| blk: {
+            var result: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0 };
+            result[12] = ip4.bytes[0];
+            result[13] = ip4.bytes[1];
+            result[14] = ip4.bytes[2];
+            result[15] = ip4.bytes[3];
+            break :blk result;
+        },
+        .ip6 => |ip6| ip6.bytes,
+    };
 }
 
-fn isLinklocal(a: std.net.Address) bool {
-    return a.in6.sa.addr[0] == 0xfe and (a.in6.sa.addr[1] & 0xc0) == 0x80;
+fn isMulticast(a: std.Io.net.IpAddress) bool {
+    const bytes = getIp6Bytes(a);
+    return bytes[0] == 0xff;
 }
 
-fn isLoopback(a: std.net.Address) bool {
-    return a.in6.sa.addr[0] == 0 and a.in6.sa.addr[1] == 0 and
-        a.in6.sa.addr[2] == 0 and
-        a.in6.sa.addr[12] == 0 and a.in6.sa.addr[13] == 0 and
-        a.in6.sa.addr[14] == 0 and a.in6.sa.addr[15] == 1;
+fn isLinklocal(a: std.Io.net.IpAddress) bool {
+    const bytes = getIp6Bytes(a);
+    return bytes[0] == 0xfe and (bytes[1] & 0xc0) == 0x80;
 }
 
-fn isSitelocal(a: std.net.Address) bool {
-    return a.in6.sa.addr[0] == 0xfe and (a.in6.sa.addr[1] & 0xc0) == 0xc0;
+fn isLoopback(a: std.Io.net.IpAddress) bool {
+    const bytes = getIp6Bytes(a);
+    return bytes[0] == 0 and bytes[1] == 0 and
+        bytes[2] == 0 and
+        bytes[12] == 0 and bytes[13] == 0 and
+        bytes[14] == 0 and bytes[15] == 1;
 }
 
-fn cmpGetScope(addr: std.net.Address) usize {
+fn isSitelocal(a: std.Io.net.IpAddress) bool {
+    const bytes = getIp6Bytes(a);
+    return bytes[0] == 0xfe and (bytes[1] & 0xc0) == 0xc0;
+}
+
+fn cmpGetScope(addr: std.Io.net.IpAddress) usize {
+    const bytes = getIp6Bytes(addr);
     if (isMulticast(addr)) {
-        return addr.in6.sa.addr[1] & 15;
+        return bytes[1] & 15;
     } else if (isLinklocal(addr)) {
         return 2;
     } else if (isLoopback(addr)) {
@@ -707,7 +603,7 @@ fn cmpGetScope(addr: std.net.Address) usize {
     return 14;
 }
 
-fn cmpAddresses(a: std.net.Address, b: std.net.Address) bool {
+fn cmpAddresses(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
     // RFC 6761. Rules 3, 4, and 7 are omitted.
 
     // Rule 6: Prefer higher precedence
@@ -730,7 +626,7 @@ fn cmpAddresses(a: std.net.Address, b: std.net.Address) bool {
     return false;
 }
 
-fn addrCmpLessThan(context: void, b: std.net.Address, a: std.net.Address) bool {
+fn addrCmpLessThan(context: void, b: std.Io.net.IpAddress, a: std.Io.net.IpAddress) bool {
     _ = context;
     return cmpAddresses(a, b);
 }

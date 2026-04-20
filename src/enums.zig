@@ -72,12 +72,12 @@ pub const ResourceType = enum(u16) {
 
     pub fn readFrom(reader: *std.Io.Reader) !Self {
         const resource_type_int = try reader.takeInt(u16, .big);
-        return std.meta.intToEnum(Self, resource_type_int) catch |err| {
+        return std.enums.fromInt(Self, resource_type_int) orelse {
             logger.err(
-                "unknown resource type {d}, got {s}",
-                .{ resource_type_int, @errorName(err) },
+                "unknown resource type {d}",
+                .{resource_type_int},
             );
-            return err;
+            return error.InvalidEnumTag;
         };
     }
 
@@ -101,12 +101,12 @@ pub const ResourceClass = enum(u16) {
 
     pub fn readFrom(reader: *std.Io.Reader) !@This() {
         const resource_class_int = try reader.takeInt(u16, .big);
-        return std.meta.intToEnum(@This(), resource_class_int) catch |err| {
+        return std.enums.fromInt(@This(), resource_class_int) orelse {
             logger.err(
-                "unknown resource class {d}, got {s}",
-                .{ resource_class_int, @errorName(err) },
+                "unknown resource class {d}",
+                .{resource_class_int},
             );
-            return err;
+            return error.InvalidEnumTag;
         };
     }
 

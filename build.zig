@@ -14,9 +14,9 @@ pub fn build(b: *Builder) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = if (option_libc) true else null,
         }),
     });
-    if (option_libc) exe.linkLibC();
     b.installArtifact(exe);
 
     const exe_tinyhost = b.addExecutable(.{
@@ -25,9 +25,9 @@ pub fn build(b: *Builder) void {
             .root_source_file = b.path("src/main_tinyhost.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = if (option_libc) true else null,
         }),
     });
-    if (option_libc) exe.linkLibC();
     b.installArtifact(exe_tinyhost);
 
     _ = b.addModule("zigdig", .{ .root_source_file = b.path("src/lib.zig") });

@@ -11,7 +11,7 @@ pub var current_log_level: std.log.Level = .info;
 
 fn logfn(
     comptime message_level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: @TypeOf(.enum_literal),
     comptime format: []const u8,
     args: anytype,
 ) void {
@@ -20,34 +20,25 @@ fn logfn(
     }
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        _ = gpa.deinit();
-    }
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const debug = std.process.getEnvVarOwned(allocator, "DEBUG") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => try allocator.dupe(u8, ""),
-        else => return err,
-    };
-    defer allocator.free(debug);
-    if (std.mem.eql(u8, debug, "1")) current_log_level = .debug;
+    if (std.mem.eql(u8, init.environ_map.get("DEBUG") orelse "", "1")) current_log_level = .debug;
 
-    var args_it = try std.process.argsWithAllocator(allocator);
-    defer args_it.deinit();
-    _ = args_it.skip();
+    var args_it = init.minimal.args.iterate();
+    _ = args_it.next(); // skip program name
 
     const name_string = (args_it.next() orelse {
         logger.warn("no name provided", .{});
         return error.InvalidArgs;
     });
 
-    var addrs = try dns.helpers.getAddressList(name_string, 80, allocator);
+    var addrs = try dns.helpers.getAddressList(io, name_string, 80, allocator);
     defer addrs.deinit();
 
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
 
     for (addrs.addrs) |addr| {
         try stdout.interface.print("{s} has address {f}\n", .{ name_string, addr });
