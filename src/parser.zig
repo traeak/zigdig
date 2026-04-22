@@ -50,8 +50,8 @@ pub const ResourceDataHolder = struct {
 
     pub fn readAllAlloc(
         self: @This(),
-        allocator: std.mem.Allocator,
         reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
     ) !dns.ResourceData.Opaque {
         const opaque_rdata = try allocator.alloc(u8, self.size);
         const read_bytes = try reader.read(opaque_rdata);

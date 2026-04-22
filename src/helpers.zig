@@ -400,8 +400,8 @@ pub fn receiveTrustedAddresses(
 }
 
 fn fetchTrustedAddresses(
-    allocator: std.mem.Allocator,
     io: std.Io,
+    allocator: std.mem.Allocator,
     name: dns.Name,
     qtype: dns.ResourceType,
 ) ![]std.Io.net.IpAddress {
@@ -435,7 +435,7 @@ fn fetchTrustedAddresses(
 }
 
 // implementation taken from std.net address resolution
-fn lookupHosts(allocator: std.mem.Allocator, io: std.Io, addrs: *std.ArrayList(std.Io.net.IpAddress), port: u16, name: []const u8) !void {
+fn lookupHosts(io: std.Io, allocator: std.mem.Allocator, addrs: *std.ArrayList(std.Io.net.IpAddress), port: u16, name: []const u8) !void {
     const file = std.Io.Dir.openFileAbsolute(io, "/etc/hosts", .{}) catch |err| switch (err) {
         error.FileNotFound,
         error.NotDir,
@@ -495,15 +495,15 @@ pub fn getAddressList(io: std.Io, incoming_name: []const u8, port: u16, allocato
         try final_list.append(allocator, .{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = port } });
     } else {
         if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
-            try lookupHosts(allocator, io, &final_list, port, incoming_name);
+            try lookupHosts(io, allocator, &final_list, port, incoming_name);
 
             if (final_list.items.len == 0) {
                 // if that didn't work, go to dns server
-                const addrs_v4 = try fetchTrustedAddresses(allocator, io, name, .A);
+                const addrs_v4 = try fetchTrustedAddresses(io, allocator, name, .A);
                 defer allocator.free(addrs_v4);
                 for (addrs_v4) |addr| try final_list.append(allocator, addr);
 
-                const addrs_v6 = try fetchTrustedAddresses(allocator, io, name, .AAAA);
+                const addrs_v6 = try fetchTrustedAddresses(io, allocator, name, .AAAA);
                 defer allocator.free(addrs_v6);
                 for (addrs_v6) |addr| try final_list.append(allocator, addr);
             }
